@@ -118,3 +118,70 @@ def chain_dp(single_energies, pair_matrices):
     e, a = min(final, key=lambda x: (x[0], x[1]))
     return a, e
 
+
+# ---------------------------------------------------------------------------
+# 多骨架共享 rotamer 的独立全枚举参考（本迭代）。
+#
+# 每个 backbone 是 {"singles": ..., "pairs": ...} 的 dict；各骨架位点数与
+# 逐位点 rotamer 数相同。构象必须在每个骨架上都无硬冲突。目标按字典序
+# (max_b E_b, sum_b w_b E_b) 最小，两级都并列时取构象字典序最小。
+# 与被测实现完全独立：朴素嵌套求和 + itertools.product，不 import 核心。
+# ---------------------------------------------------------------------------
+
+
+def _backbone_energy(singles, pairs, assign):
+    """构象在单骨架上的总能；硬冲突返回 None。"""
+    total = 0
+    for p, r in enumerate(assign):
+        v = singles[p][r]
+        if v is None:
+            return None
+        total += v
+    for i, j, m in pairs:
+        v = m[assign[i]][assign[j]]
+        if v is None:
+            return None
+        total += v
+    return total
+
+
+def brute_backbones(backbones, weights=None, fixed=None):
+    """独立多骨架全枚举。
+
+    返回 ``(assignment, scores_tuple, worst, weighted_sum)``；
+    不存在对所有骨架都可行的构象时返回 ``(None, None, None, None)``。
+    ``weights`` 为 None 时按全 1 等权。
+    """
+    n_b = len(backbones)
+    if weights is None:
+        weights = (1,) * n_b
+    n = len(backbones[0]["singles"])
+    domains = []
+    for p in range(n):
+        if fixed is not None and p in fixed:
+            domains.append((fixed[p],))
+        else:
+            domains.append(tuple(range(len(backbones[0]["singles"][p]))))
+
+    best = None  # (key, assign, scores)
+    for assign in product(*domains):
+        scores = []
+        for bb in backbones:
+            e = _backbone_energy(bb["singles"], bb["pairs"], assign)
+            if e is None:
+                break
+            scores.append(e)
+        else:
+            scores = tuple(scores)
+            worst = max(scores)
+            wsum = sum(w * e for w, e in zip(weights, scores))
+            key = (worst, wsum)
+            cand = (key, assign, scores)
+            if best is None or key < best[0] or \
+                    (key == best[0] and assign < best[1]):
+                best = cand
+    if best is None:
+        return None, None, None, None
+    (worst, wsum), assign, scores = best
+    return assign, scores, worst, wsum
+

@@ -19,6 +19,13 @@ MAX_POSITIONS = 12
 MIN_ROTAMERS = 2
 MAX_ROTAMERS = 5
 
+# 多骨架共享 rotamer 枚举选择（本迭代）的更紧边界：
+# 至多 6 位点、每点至多 3 个 rotamer、2..3 个骨架（3^6 = 729，可全枚举）。
+MULTI_MAX_POSITIONS = 6
+MULTI_MAX_ROTAMERS = 3
+MIN_BACKBONES = 2
+MAX_BACKBONES = 3
+
 
 def _is_real_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
@@ -190,3 +197,103 @@ def validate_fixed(n: int, counts, fixed) -> dict:
             )
         result[p] = r
     return result
+
+
+def validate_backbones(backbones):
+    """校验多骨架输入并归一化。
+
+    ``backbones`` 为 list/tuple，每项是一个 dict::
+
+        {"singles": single_energies, "pairs": pair_matrices}
+
+    键名也兼容单骨架接口的 ``"single_energies"`` / ``"pair_matrices"``。
+    每个骨架的能量契约与单骨架完全一致（走 :func:`validate_problem`），
+    另要求：
+
+    - 骨架数在 ``[MIN_BACKBONES, MAX_BACKBONES]``（2..3）；
+    - 位点数 ``n <= MULTI_MAX_POSITIONS``（6）；
+    - 每位点 rotamer 数在 ``[MIN_ROTAMERS, MULTI_MAX_ROTAMERS]``（2..3）；
+    - **所有骨架共用同一组 rotamer**：位点数与逐位点 rotamer 数必须完全相同。
+
+    返回归一化规格的 tuple，每项为 ``validate_problem`` 的
+    ``(n, counts, singles, pairs)``。任何非法输入在任何求解前抛
+    :class:`RotamerInputError`，错误信息带骨架下标定位。
+    """
+    if not isinstance(backbones, (list, tuple)):
+        raise RotamerInputError(
+            f"backbones: 必须是 list/tuple 的骨架序列, 得到 {type(backbones).__name__}"
+        )
+    b_count = len(backbones)
+    if not (MIN_BACKBONES <= b_count <= MAX_BACKBONES):
+        raise RotamerInputError(
+            f"backbones: 骨架数 {b_count} 不在 [{MIN_BACKBONES}, {MAX_BACKBONES}]"
+        )
+
+    specs = []
+    reference = None
+    for bi, item in enumerate(backbones):
+        where = f"backbones[{bi}]"
+        if not isinstance(item, dict):
+            raise RotamerInputError(
+                f"{where}: 每个骨架必须是 dict, 得到 {type(item).__name__}"
+            )
+        if "singles" in item:
+            raw_singles = item["singles"]
+        elif "single_energies" in item:
+            raw_singles = item["single_energies"]
+        else:
+            raise RotamerInputError(
+                f"{where}: 缺少键 'singles'（兼容名 'single_energies'）"
+            )
+        if "pairs" in item:
+            raw_pairs = item["pairs"]
+        elif "pair_matrices" in item:
+            raw_pairs = item["pair_matrices"]
+        else:
+            raw_pairs = ()
+
+        try:
+            spec = validate_problem(raw_singles, raw_pairs)
+        except RotamerInputError as exc:
+            raise RotamerInputError(f"{where}: {exc}") from exc
+        n, counts, _, _ = spec
+
+        if n > MULTI_MAX_POSITIONS:
+            raise RotamerInputError(
+                f"{where}: 多骨架位点数 {n} 超过上限 {MULTI_MAX_POSITIONS}"
+            )
+        for pos, k in enumerate(counts):
+            if k > MULTI_MAX_ROTAMERS:
+                raise RotamerInputError(
+                    f"{where}: 位置 {pos} 的 rotamer 数 {k} 超过多骨架上限 "
+                    f"{MULTI_MAX_ROTAMERS}"
+                )
+        shape = (n, counts)
+        if reference is None:
+            reference = shape
+        elif shape != reference:
+            raise RotamerInputError(
+                f"{where}: 位点数/逐位点 rotamer 数 {shape} 与 backbones[0] 的 "
+                f"{reference} 不一致；多个骨架必须共用同一组 rotamer"
+            )
+        specs.append(spec)
+    return tuple(specs)
+
+
+def validate_weights(n_backbones: int, weights):
+    """校验骨架权重：``None`` 表示等权；否则为正整数序列（拒绝 bool/float）。"""
+    if weights is None:
+        return (1,) * n_backbones
+    if not isinstance(weights, (list, tuple)):
+        raise RotamerInputError(
+            f"weights: 必须是 list/tuple 或 None, 得到 {type(weights).__name__}"
+        )
+    if len(weights) != n_backbones:
+        raise RotamerInputError(
+            f"weights: 长度 {len(weights)} 必须等于骨架数 {n_backbones}"
+        )
+    normalized = []
+    for b, w in enumerate(weights):
+        _check_positive_int(w, f"weights[{b}]")
+        normalized.append(w)
+    return tuple(normalized)
