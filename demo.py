@@ -1,4 +1,4 @@
-"""固定输入演示：离散 rotamer 能量选择（分支限界）。
+"""固定输入演示：离散 rotamer 能量选择（分支限界 + 多骨架枚举）。
 
 运行：python demo.py（仅标准库，秒级完成，无网络/无第三方依赖）。
 
@@ -8,6 +8,8 @@
   2. 一个确定性生成的 6 位置实例的完整分析（最优、次优、逐位置最小代价增量）。
   3. 12 位置实例在小节点预算下耗尽：只报“当前最优 + 全局下界”，不声称精确。
   4. 实际触发的输入拒绝边界（矩阵维度错误、bool 冒充整数）。
+  5. 多个给定骨架共用一组 rotamer：全枚举先最小化最坏骨架能量，
+     再按给定权重的加权平均破并列，给出每骨架得分；含无解边界与输入拒绝。
 """
 
 import random
@@ -16,8 +18,11 @@ import time
 from rotamer_select import (
     optimize,
     solve,
+    select_for_backbones,
+    MultiBackboneProblem,
     RotamerInputError,
     SolveStatus,
+    BackboneSolveStatus,
 )
 
 
@@ -76,6 +81,26 @@ def generated_instance(n, seed):
              for _ in range(counts[i])]
         pairs.append((i, i + 1, m))
     return singles, pairs
+
+
+def generated_multi_backbone(n, b, seed, k=3, none_prob=0.10):
+    """确定性生成 b 个共用同一组 rotamer 的骨架（固定种子，无外部数据）。
+
+    每位点统一 ``k`` 个 rotamer（默认 3，即题面上限）。
+    """
+    counts = [k] * n
+    backbones = []
+    for bi in range(b):
+        rng = random.Random(20260924 + n * 331 + seed * 17 + 509 + bi)
+        singles = [[rng.randint(-6, 6) for _ in range(k)] for _ in counts]
+        pairs = []
+        for i in range(n - 1):
+            m = [[None if rng.random() < none_prob
+                  else rng.randint(-9, 6) for _ in range(counts[i + 1])]
+                 for _ in range(counts[i])]
+            pairs.append((i, i + 1, m))
+        backbones.append((singles, pairs))
+    return backbones
 
 
 def main():
@@ -143,8 +168,81 @@ def main():
     print(f"口径校验   : {small.global_lower_bound} <= {full.energy} "
           f"<= {small.energy} 成立；预算耗尽时只给界，不声称精确。")
 
-    # ---- 4. 实际触发的拒绝边界 ----
-    section("4. 输入拒绝边界（现场触发，非静默纠正）")
+    # ---- 4. 多骨架共用 rotamer：minimax + 加权平均 ----
+    section("4. 多骨架共用一组 rotamer（3 骨架，先最坏能量、再加权平均）")
+    # 单位点、每点 3 个共用 rotamer，3 个骨架的偏好互相冲突：
+    #   候选 r0/r1 各讨好一个骨架（该骨架得 0，另外两个得 10）；
+    #   r2 是折中：三个骨架都得 4。
+    bb_singles = [[0, 10, 4], [10, 0, 4], [10, 10, 4]]
+    backbones = [( [s], []) for s in bb_singles]
+    print("候选 rotamer 三选一；每骨架各自的单体能 (r0, r1, r2):")
+    for bi, s in enumerate(bb_singles):
+        print(f"  骨架 {bi}: {tuple(s)}")
+
+    sel = select_for_backbones(backbones)
+    print(f"\n等权选择   : {sel.assignment}  [{sel.status.value}]")
+    print(f"每骨架得分 : {sel.scores}  最坏能量 = {sel.worst_energy}")
+    print(f"加权和 = {sel.weighted_sum}，加权平均 = "
+          f"{sel.weighted_average:.3f}（分母 {len(backbones)}）")
+    print("  （r0/r1 的最坏能量是 10；r2 三个骨架都是 4，最坏仅 4，"
+          "故按最坏能量选 r2）")
+
+    # 权重破并列：先构造最坏能量并列的候选，再用权重决定。
+    tie_bb = [
+        ([[0, 10]], []),   # r0: b0=0,b1=10；r1: b0=10,b1=0；最坏都是 10
+        ([[10, 0]], []),
+    ]
+    eq = select_for_backbones(tie_bb)
+    wgt = select_for_backbones(tie_bb, weights=(1, 3))
+    print(f"\n最坏能量并列时：等权 -> {eq.assignment}（r0 与 r1 加权和都是 10，"
+          f"取字典序 r0）；")
+    print(f"              权重 (1,3) -> {wgt.assignment}"
+          f"（r0 加权和 {1*0 + 3*10}，r1 加权和 {wgt.weighted_sum}，骨架1 更重要）")
+
+    # 边界：3 骨架 × 6 位点 × 每点 3 rotamer = 729 构象（无硬冲突）。
+    big = generated_multi_backbone(6, 3, seed=7, k=3, none_prob=0.0)
+    bsel = select_for_backbones(big)
+    print(f"\n上限规模   : 6 位点 × 每点 3 rotamer × 3 骨架，"
+          f"枚举 {bsel.assignments_evaluated} 构象、"
+          f"其中 {bsel.feasible_assignments} 个对所有骨架可行")
+    print(f"最优共用构象: {bsel.assignment}  最坏能量 = {bsel.worst_energy}")
+    print(f"每骨架得分 : {bsel.scores}")
+
+    # ---- 5. 多骨架无解边界与输入拒绝 ----
+    section("5. 多骨架边界：硬冲突导致无共用构象 / 实际触发的拒绝")
+    colliding = [
+        ([[0, None]], []),   # r1 在骨架 0 硬冲突
+        ([[None, 0]], []),   # r0 在骨架 1 硬冲突
+    ]
+    inf = select_for_backbones(colliding)
+    print("r1 在骨架0冲突、r0 在骨架1冲突：")
+    print(f"  状态={inf.status.value}（枚举 {inf.assignments_evaluated} 个，"
+          f"可行 {inf.feasible_assignments} 个），无半更新、结果如实标记无解")
+    assert inf.status is BackboneSolveStatus.INFEASIBLE
+    assert inf.assignment is None and inf.worst_energy is None
+
+    prob = MultiBackboneProblem([
+        ([[0, 0], [0, 0]], [(0, 1, [[0, 0], [0, 0]])]),
+        ([[0, 0], [0, 0]], [(0, 1, [[0, None], [0, 0]])]),
+    ])
+    try:
+        prob.scores_of((0, 1))
+    except RotamerInputError as exc:
+        print(f"手工构象在骨架 1 硬冲突被明确报错: {exc}")
+
+    try:
+        # 两骨架 rotamer 数不一致：不共用同一组 rotamer，直接拒绝。
+        select_for_backbones([([[0, 1]], []), ([[0, 1, 2]], [])])
+    except RotamerInputError as exc:
+        print(f"骨架间 rotamer 集合不一致被拒绝: {exc}")
+
+    try:
+        select_for_backbones(tie_bb, weights=(1, 0))  # 权重必须为正整数
+    except RotamerInputError as exc:
+        print(f"非法权重被拒绝: {exc}")
+
+    # ---- 6. 实际触发的拒绝边界（单骨架） ----
+    section("6. 输入拒绝边界（现场触发，非静默纠正）")
     bad_singles = [[0, 1], [2, 3, 4]]
     bad_matrix = [[0, 0, 0]]  # 位置 0 有 2 个 rotamer，矩阵却只有 1 行
     try:

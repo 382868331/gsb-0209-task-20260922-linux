@@ -19,6 +19,12 @@ MAX_POSITIONS = 12
 MIN_ROTAMERS = 2
 MAX_ROTAMERS = 5
 
+# 多骨架联合选择（backbones.py）的规模边界：最多 6 位点、每点 1..3 选项、3 骨架。
+MULTI_MAX_POSITIONS = 6
+MULTI_MIN_ROTAMERS = 1
+MULTI_MAX_ROTAMERS = 3
+MAX_BACKBONES = 3
+
 
 def _is_real_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
@@ -46,7 +52,9 @@ def _check_positive_int(value, name: str):
         raise RotamerInputError(f"{name}: 必须为正整数, 得到 {value}")
 
 
-def validate_problem(single_energies, pair_matrices):
+def validate_problem(single_energies, pair_matrices,
+                     min_rotamers=MIN_ROTAMERS, max_positions=MAX_POSITIONS,
+                     max_rotamers=MAX_ROTAMERS):
     """校验并归一化问题输入。
 
     返回 ``(n, counts, singles, pairs)``：
@@ -56,6 +64,9 @@ def validate_problem(single_energies, pair_matrices):
     - ``singles``: ``tuple[tuple[int|None, ...], ...]`` 单体能
     - ``pairs``: ``tuple[(i, j, tuple[tuple[int|None, ...], ...]), ...]``，
       按 (i, j) 排序去重
+
+    ``min_rotamers/max_positions/max_rotamers`` 允许多骨架模块以更窄的
+    边界复用本校验；默认值即原单肽契约（1..12 位置、每点 2..5 rotamer）。
     """
     # ---- 单体能 / 位置数 ----
     if not isinstance(single_energies, (list, tuple)):
@@ -65,9 +76,9 @@ def validate_problem(single_energies, pair_matrices):
     n = len(single_energies)
     if n == 0:
         raise RotamerInputError("single_energies: 至少需要 1 个位置")
-    if n > MAX_POSITIONS:
+    if n > max_positions:
         raise RotamerInputError(
-            f"single_energies: 位置数 {n} 超过上限 {MAX_POSITIONS}"
+            f"single_energies: 位置数 {n} 超过上限 {max_positions}"
         )
 
     counts = []
@@ -79,9 +90,9 @@ def validate_problem(single_energies, pair_matrices):
                 f"{where}: 必须是 list/tuple, 得到 {type(col).__name__}"
             )
         k = len(col)
-        if not (MIN_ROTAMERS <= k <= MAX_ROTAMERS):
+        if not (min_rotamers <= k <= max_rotamers):
             raise RotamerInputError(
-                f"{where}: rotamer 数 {k} 不在 [{MIN_ROTAMERS}, {MAX_ROTAMERS}]"
+                f"{where}: rotamer 数 {k} 不在 [{min_rotamers}, {max_rotamers}]"
             )
         norm = []
         for r, v in enumerate(col):

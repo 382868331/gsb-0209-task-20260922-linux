@@ -12,7 +12,15 @@
 """
 
 from .errors import RotamerError, RotamerInputError
-from .validation import MAX_POSITIONS, MIN_ROTAMERS, MAX_ROTAMERS
+from .validation import (
+    MAX_POSITIONS,
+    MIN_ROTAMERS,
+    MAX_ROTAMERS,
+    MULTI_MAX_POSITIONS,
+    MULTI_MIN_ROTAMERS,
+    MULTI_MAX_ROTAMERS,
+    MAX_BACKBONES,
+)
 from .solver import DEFAULT_NODE_BUDGET
 from .model import (
     RotamerProblem,
@@ -25,11 +33,21 @@ from .model import (
     optimize,
     energy_of,
 )
+from .backbones import (
+    MultiBackboneProblem,
+    BackboneSolveStatus,
+    BackboneSelection,
+    select_for_backbones,
+)
 
 __all__ = [
     "MAX_POSITIONS",
     "MIN_ROTAMERS",
     "MAX_ROTAMERS",
+    "MULTI_MAX_POSITIONS",
+    "MULTI_MIN_ROTAMERS",
+    "MULTI_MAX_ROTAMERS",
+    "MAX_BACKBONES",
     "DEFAULT_NODE_BUDGET",
     "RotamerError",
     "RotamerInputError",
@@ -42,4 +60,8 @@ __all__ = [
     "solve",
     "optimize",
     "energy_of",
+    "MultiBackboneProblem",
+    "BackboneSolveStatus",
+    "BackboneSelection",
+    "select_for_backbones",
 ]

@@ -72,6 +72,53 @@ def brute_fixed(single_energies, pair_matrices, position, rotamer):
     return best_a, best_e
 
 
+def brute_backbones(backbones, weights=None):
+    """独立多骨架全枚举参考：返回 (assignment, scores, worst, weighted_sum)。
+
+    ``backbones`` 为若干 ``(single_energies, pair_matrices)``，
+    ``weights`` 为 None（等权）或正整数权重序列。两级目标：
+    先最小化最坏骨架能量，并列时最小化加权和，再并列取字典序最小。
+    无对所有骨架可行的构象时返回 (None, None, None, None)。
+    与其他参考一样不 import 被测核心。
+    """
+    n = len(backbones[0][0])
+    if weights is None:
+        weights = (1,) * len(backbones)
+    best = None  # (worst, wsum, assign, scores)
+    for assign in product(*(range(len(c)) for c in backbones[0][0])):
+        scores = []
+        feasible = True
+        for singles, pairs in backbones:
+            total = 0
+            for p, r in enumerate(assign):
+                v = singles[p][r]
+                if v is None:
+                    feasible = False
+                    break
+                total += v
+            if not feasible:
+                break
+            for i, j, m in pairs:
+                v = m[assign[i]][assign[j]]
+                if v is None:
+                    feasible = False
+                    break
+                total += v
+            if not feasible:
+                break
+            scores.append(total)
+        if not feasible:
+            continue
+        worst = max(scores)
+        wsum = sum(w * s for w, s in zip(weights, scores))
+        key = (worst, wsum, assign)
+        if best is None or key < (best[0], best[1], best[2]):
+            best = (worst, wsum, assign, tuple(scores))
+    if best is None:
+        return None, None, None, None
+    return best[2], best[3], best[0], best[1]
+
+
 def chain_dp(single_energies, pair_matrices):
     """独立的相邻对 min-sum 动态规划参考（Viterbi 式）。
 
