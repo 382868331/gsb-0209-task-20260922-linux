@@ -76,6 +76,8 @@ class SolveResult:
     """真实最优总能量的可信下界；INFEASIBLE 时为 None。"""
     nodes_expanded: int
     budget: int
+    category_counts: dict | None = None
+    """``assignment`` 的类别计数 {类别: 数量}；无构象或未设类别时为 None。"""
 
     @property
     def exact(self) -> bool:
@@ -120,6 +122,10 @@ class AnalysisResult:
     """第二个不同构象（与最优构象不同的能量最小者，并列取字典序最小）。"""
     second_energy: int | None
     fixed_costs: tuple
+    category_counts: dict | None = None
+    """最优构象的类别计数；未设类别或无构象时为 None。"""
+    second_category_counts: dict | None = None
+    """次优构象的类别计数；未设类别或无次优构象时为 None。"""
     """``fixed_costs[p]`` 是长度 k_p 的元组；最优 rotamer 位置为 None，
     其余为 :class:`FixedCostEntry`。"""
 
@@ -135,7 +141,18 @@ _STATUS_MAP = {
 }
 
 
-def _to_result(raw: dict) -> SolveResult:
+def _category_counts(compiled, assignment):
+    """统计构象的类别计数；未设类别或构象为 None 时返回 None。"""
+    if compiled.categories is None or assignment is None:
+        return None
+    counts = {}
+    for p, r in enumerate(assignment):
+        label = compiled.categories[p][r]
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _to_result(raw: dict, compiled=None) -> SolveResult:
     return SolveResult(
         status=_STATUS_MAP[raw["status"]],
         assignment=raw["assignment"],
@@ -143,6 +160,8 @@ def _to_result(raw: dict) -> SolveResult:
         global_lower_bound=raw["global_lower_bound"],
         nodes_expanded=raw["nodes_expanded"],
         budget=raw["budget"],
+        category_counts=(_category_counts(compiled, raw["assignment"])
+                         if compiled is not None else None),
     )
 
 
@@ -155,17 +174,23 @@ class RotamerProblem:
     pair_matrices: 若干 ``(i, j, matrix)``，必须满足 ``i < j``，
         matrix 为 k_i × k_j 的 list/tuple 矩形（行对应 i、列对应 j），
         元素 int 或 None；同一位置对至多给一个矩阵。
+    categories: 可选，与 single_energies 同形的类别标签表；每个 rotamer
+        恰好归属一个类别（非空 str 或 int）。
+    quotas: 可选，``{类别: (lo, hi)}`` 全局数量闭区间（非负整数）；
+        未列出的类别不限制。硬冲突仍不可选，配额不以罚分近似。
     """
 
-    def __init__(self, single_energies, pair_matrices=()):
-        self._compiled = compile_problem(single_energies, pair_matrices)
+    def __init__(self, single_energies, pair_matrices=(),
+                 categories=None, quotas=None):
+        self._compiled = compile_problem(single_energies, pair_matrices,
+                                         categories=categories, quotas=quotas)
         self.n = self._compiled.n
         self.counts = self._compiled.counts
 
     def solve(self, fixed=None, budget=DEFAULT_NODE_BUDGET) -> SolveResult:
         """求最小能量构象。``fixed`` 可给 ``{position: rotamer}`` 附加固定约束。"""
         raw = branch_and_bound(self._compiled, fixed=fixed, budget=budget)
-        return _to_result(raw)
+        return _to_result(raw, self._compiled)
 
     def optimize(self, budget=DEFAULT_NODE_BUDGET) -> AnalysisResult:
         """完整分析，见 :func:`optimize`。"""
@@ -177,20 +202,25 @@ class RotamerProblem:
 
 
 def solve(single_energies, pair_matrices=(), *, fixed=None,
+          categories=None, quotas=None,
           budget=DEFAULT_NODE_BUDGET) -> SolveResult:
-    """一次性便捷接口：校验输入并求最小能量构象。"""
-    compiled = compile_problem(single_energies, pair_matrices)
-    return _to_result(branch_and_bound(compiled, fixed=fixed, budget=budget))
+    """一次性便捷接口：校验输入并求最小能量构象（可带类别配额）。"""
+    compiled = compile_problem(single_energies, pair_matrices,
+                               categories=categories, quotas=quotas)
+    return _to_result(branch_and_bound(compiled, fixed=fixed, budget=budget),
+                      compiled)
 
 
 def optimize(single_energies, pair_matrices=(), *,
+             categories=None, quotas=None,
              budget=DEFAULT_NODE_BUDGET) -> AnalysisResult:
-    """一次性便捷接口：求最优、次优与全部固定代价增量。
+    """一次性便捷接口：求最优、次优与全部固定代价增量（可带类别配额）。
 
     ``budget`` 是**每个**子搜索（共 2 + 非最优 rotamer 数次，至多 50 次）
     各自的节点展开预算；``nodes_expanded`` 为所有子搜索的实际展开数之和。
     """
-    compiled = compile_problem(single_energies, pair_matrices)
+    compiled = compile_problem(single_energies, pair_matrices,
+                               categories=categories, quotas=quotas)
     return _analyze(compiled, budget)
 
 
@@ -208,14 +238,14 @@ def _analyze(compiled, budget) -> AnalysisResult:
     counts = compiled.counts
     total_nodes = 0
 
-    base = _to_result(branch_and_bound(compiled, budget=budget))
+    base = _to_result(branch_and_bound(compiled, budget=budget), compiled)
     total_nodes += base.nodes_expanded
 
     # ---- 第二个不同构象：排除最优（或当前最优）构象后再搜 ----
     best_assign = base.assignment
     if best_assign is not None:
         raw2 = branch_and_bound(compiled, forbid=best_assign, budget=budget)
-        second = _to_result(raw2)
+        second = _to_result(raw2, compiled)
     else:
         # 没有任何已知可行构象可排除：
         # - base 为 INFEASIBLE：确无第二个构象；
@@ -226,7 +256,7 @@ def _analyze(compiled, budget) -> AnalysisResult:
         second = _to_result({
             "status": placeholder_status, "assignment": None, "energy": None,
             "global_lower_bound": None, "nodes_expanded": 0, "budget": budget,
-        })
+        }, compiled)
     total_nodes += second.nodes_expanded
 
     # ---- 逐位置固定到每个非最优 rotamer 的代价增量 ----
@@ -297,4 +327,6 @@ def _analyze(compiled, budget) -> AnalysisResult:
         second_assignment=second.assignment,
         second_energy=second.energy,
         fixed_costs=tuple(columns),
+        category_counts=base.category_counts,
+        second_category_counts=second.category_counts,
     )

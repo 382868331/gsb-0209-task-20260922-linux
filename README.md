@@ -4,6 +4,8 @@
 rotamer，用**分支限界（branch-and-bound）**求总能量最小的构象，并给出：
 
 - 字典序最小的最优构象与总能量（能量并列时按 rotamer 下标序列字典序）；
+- **可选类别配额**：每个 rotamer 归属唯一类别，调用方可按类别限定全局
+  选择数量的闭区间 `[lo, hi]`（非负整数）；结果附带类别计数；
 - **第二个不同构象**及其能量（次优并列时同样取字典序最小）；
 - **逐位置固定代价增量**：把位置 p 强制固定到任意另一个 rotamer 后，
   可达到的最小总能量相对最优的增量（硬冲突 → 证明无解）；
@@ -20,7 +22,7 @@ rotamer，用**分支限界（branch-and-bound）**求总能量最小的构象�
 ## 准确命令
 
 ```bash
-# 必要测试（36 个用例，约 1 秒）
+# 必要测试（56 个用例，约 1 秒）
 python -m unittest discover -s tests -v
 
 # 演示（现场真实计算，约 0.05 秒，上限约 8 秒预算内；无 sleep、无预录结果）
@@ -30,6 +32,9 @@ python demo.py
 在仓库根目录（本文件所在目录）执行。测试中“独立参考”
 （`tests/reference.py`：≤6 位置全枚举 + 链式动态规划）**不导入被测核心**，
 期望值不由被测代码产生；与 `energy_of` 的往返一致只作为补充断言。
+
+> **口径说明**：类别配额是**合成设计指标**（例如“某类侧链至少出现 k 次”
+> 的工程约束），用于组合约束求解演示；本库结果**不构成真实蛋白稳定性结论**。
 
 ## 输入数据结构
 
@@ -55,6 +60,22 @@ pair_matrices = [
   - **`bool` 不得冒充整数**（`True/False` 虽是 Python int 子类，一律拒绝）；
   - `budget`、`fixed` 中的下标同样要求真 `int` 且在界内。
 
+### 类别与配额（可选）
+
+```python
+categories = [["hyd", "pol"], ["hyd", "pol"], ...]  # 与 single_energies 同形
+quotas = {"pol": (2, 3)}                            # {类别: (lo, hi)}
+```
+
+- 每个 rotamer **恰好归属一个类别**（单一归属）；标签为非空 `str` 或 `int`
+  （`bool`/`None`/空串一律拒绝）。
+- `quotas` 限定某类别在**整条链全局**被选中次数的闭区间 `[lo, hi]`：
+  边界为非负整数（`bool` 拒绝）、`lo <= hi`、键必须是出现过的类别；
+  未列出的类别不限制数量。零配额 `(0, 0)` 表示禁用该类别。
+- 配额是**硬约束**：违反配额的构象直接不可行，不以罚分近似；
+  硬冲突（`None`）同样仍然禁止，不与配额混为罚分。
+- 每个位置仍恰好选一个 rotamer 的原要求不变。
+
 ## 公开接口
 
 ```python
@@ -62,22 +83,25 @@ from rotamer_select import solve, optimize, energy_of, RotamerProblem, SolveStat
 
 # 1) 只求最优
 res = solve(single_energies, pair_matrices,
-            fixed=None, budget=200_000)
+            fixed=None, categories=None, quotas=None, budget=200_000)
 res.status                # SolveStatus.EXACT / INFEASIBLE / BUDGET_EXHAUSTED
 res.assignment            # tuple[int,...]，字典序最小最优构象；无解/未得解时 None
 res.energy                # 最优（或当前最优）总能量，可能 None
 res.global_lower_bound    # 真实最优的可信整数下界；INFEASIBLE 时 None
 res.nodes_expanded        # 实际展开节点数
 res.exact                 # bool：最优性是否已证明
+res.category_counts       # {类别: 数量}；未设 categories 或无构象时为 None
 
 # 附加固定约束求解（如 fixed={2: 0} 表示位置 2 必须取 rotamer 0）
 solve(singles, pairs, fixed={2: 0})
 
 # 2) 完整分析：最优 + 次优 + 全部固定代价增量
-ana = optimize(singles, pairs, budget=200_000)
+ana = optimize(singles, pairs, categories=None, quotas=None,
+               budget=200_000)
 ana.assignment, ana.energy
 ana.second_assignment, ana.second_energy     # 不存在第二个可行构象时为 None
 ana.second_status
+ana.category_counts, ana.second_category_counts   # 最优/次优构象的类别计数
 ana.fixed_costs[p][r]                        # 最优 rotamer 处为 None，
                                              # 其余为 FixedCostEntry：
 entry.status            # OPTIMAL / BEST_KNOWN(预算耗尽) / INFEASIBLE
@@ -89,7 +113,7 @@ entry.lower_bound_delta# 仅 BEST_KNOWN：真实代价增量的整数下界
 energy_of(singles, pairs, assignment)
 
 # 4) 重复求解（编译一次缓存）
-prob = RotamerProblem(singles, pair_matrices)
+prob = RotamerProblem(singles, pair_matrices, categories=None, quotas=None)
 prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
 ```
 
@@ -119,6 +143,12 @@ prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
   也如实报 `EXACT`。
 - **次优构象**：对最优构象做“整构象排除”后再搜一次（只在叶深度排除，
   绝不按前缀剪枝，避免误杀仅前缀相同的构象）。
+- **配额剪枝（纯计数，不动能量下界）**：分支时若某类别已选数将超过 `hi`
+  则剪枝；若剩余位置中能取某类别的位置数加上已选数仍不足 `lo` 则剪枝；
+  叶节点再终检一次所有下界。根节点先做计数预检（下界总和 > n、
+  各类别上限总和 < n、某类别可选位置不足 `lo` 均直接判 `INFEASIBLE`）。
+  能量下界保持原有可采纳性：负成对能照常计入矩阵最小值，绝不为了剪枝
+  丢掉负对能；预算耗尽时上界（当前最优）与下界（全局下界）照旧分开报告。
 - **固定代价增量**：对每个 (位置, 非最优 rotamer) 做一次带固定约束的搜索，
   增量由该约束最优与全局最优的整数差给出；无解单独标记 `INFEASIBLE`。
 - **无浮点**：能量与界全为整数，求解全程不产生浮点误差，也不需要容差。
@@ -145,6 +175,10 @@ prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
 - “相邻”由用户显式给矩阵声明；库不假设距离/拓扑，也不做几何计算。
 - 次优与固定增量在预算耗尽时分别给 `second_status` / `BEST_KNOWN` 与下界，
   增量同样可能只是界，不做跨子搜索的联合收紧。
+- 配额可行性剪枝只做计数层面（类别可选位置数），不把对能冲突纳入
+  预检；冲突导致的不可行仍由搜索证明，最坏情况不减少指数开销。
+- 类别为单一归属（每 rotamer 一个标签），不支持多标签/层级类别。
+- 配额只约束全局总数，不支持“每段/每窗口”类局部配额。
 - 不提供命令行产品/服务/文件格式；仅作为可 `import` 的库与固定 `demo.py`。
 
 ## 仓库结构
@@ -159,6 +193,8 @@ rotamer_select/          # 题库（核心算法）
 tests/
   reference.py           # 独立参考：全枚举(≤6) + 链式 DP（不 import 核心）
   datagen.py             # 固定种子确定性数据生成
-  test_solver.py         # 36 个用例
+  test_solver.py         # 无配额核心行为用例
+  test_quotas.py         # 类别配额用例（含局部最低能破坏配额、
+                         # 类别只在冲突位置可选、零配额、同分布局）
 demo.py                  # 固定输入演示（贪心失败 / 预算耗尽 / 拒绝边界）
 ```

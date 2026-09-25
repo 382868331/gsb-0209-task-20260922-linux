@@ -15,7 +15,13 @@
 """
 
 from .errors import RotamerInputError
-from .validation import validate_problem, validate_budget, validate_fixed
+from .validation import (
+    validate_problem,
+    validate_budget,
+    validate_fixed,
+    validate_categories,
+    validate_quotas,
+)
 
 DEFAULT_NODE_BUDGET = 200_000
 
@@ -29,9 +35,11 @@ class _Compiled:
     """编译后的问题：预计算每行/全矩阵最小有限值，加速增量下界。"""
 
     __slots__ = ("n", "counts", "singles", "single_min",
-                 "incoming", "outgoing", "pair_map")
+                 "incoming", "outgoing", "pair_map",
+                 "categories", "quotas", "quota_cats", "cat_index",
+                 "suffix_avail")
 
-    def __init__(self, n, counts, singles, pairs):
+    def __init__(self, n, counts, singles, pairs, categories=None, quotas=None):
         self.n = n
         self.counts = counts
         self.singles = singles
@@ -65,10 +73,40 @@ class _Compiled:
         self.outgoing = outgoing
         self.pair_map = pair_map
 
+        # ---- 类别与配额（可选）----
+        self.categories = categories
+        self.quotas = quotas
+        if quotas:
+            qcats = list(quotas)  # 保持插入序，节点内计数元组与之对齐
+            cat_index = {c: i for i, c in enumerate(qcats)}
+            # suffix_avail[c][d] = 位置 d..n-1 中尚有机会选类别 c 的位置数
+            # （只统计单体能有限的 rotamer；对能冲突仍由搜索发现）。
+            suffix = {}
+            for c in qcats:
+                arr = [0] * (n + 1)
+                for p in range(n - 1, -1, -1):
+                    arr[p] = arr[p + 1] + (
+                        1 if any(categories[p][r] == c and singles[p][r] is not None
+                                 for r in range(counts[p]))
+                        else 0
+                    )
+                suffix[c] = tuple(arr)
+            self.quota_cats = tuple(qcats)
+            self.cat_index = cat_index
+            self.suffix_avail = suffix
+        else:
+            self.quota_cats = ()
+            self.cat_index = {}
+            self.suffix_avail = {}
 
-def compile_problem(single_energies, pair_matrices):
+
+def compile_problem(single_energies, pair_matrices, categories=None, quotas=None):
     n, counts, singles, pairs = validate_problem(single_energies, pair_matrices)
-    return _Compiled(n, counts, singles, pairs)
+    cats = validate_categories(n, counts, categories)
+    used = ({label for col in cats for label in col}
+            if cats is not None else None)
+    q = validate_quotas(quotas, used)
+    return _Compiled(n, counts, singles, pairs, categories=cats, quotas=q)
 
 
 def _validate_forbid(n, counts, forbid):
@@ -112,6 +150,11 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
     single_min = compiled.single_min
     incoming = compiled.incoming
     outgoing = compiled.outgoing
+    categories = compiled.categories
+    quotas = compiled.quotas
+    qcats = compiled.quota_cats
+    cat_index = compiled.cat_index
+    suffix_avail = compiled.suffix_avail
 
     budget = validate_budget(budget)
     fixed = validate_fixed(n, compiled.counts, fixed)
@@ -129,8 +172,22 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
                 return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
             root_lb += full_min
 
-    # 栈元素: (depth, assignment_tuple, exact_energy, lower_bound)
-    stack = [(0, (), 0, root_lb)]
+    # ---- 配额可行性预检（与能量下界无关的纯计数约束）----
+    if qcats:
+        if sum(quotas[c][0] for c in qcats) > n:
+            return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
+        used = {label for col in categories for label in col}
+        if all(label in quotas for label in used) and \
+                sum(quotas[c][1] for c in qcats) < n:
+            # 每个类别都有上限且总和不足 n 个位置，必无解。
+            return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
+        for c in qcats:
+            if suffix_avail[c][0] < quotas[c][0]:
+                return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
+
+    # 栈元素: (depth, assignment_tuple, exact_energy, lower_bound, quota_counts)
+    # quota_counts 与 compiled.quota_cats 对齐，记录各类别已选次数。
+    stack = [(0, (), 0, root_lb, (0,) * len(qcats))]
     best_energy = None
     best_assign = None
     expanded = 0
@@ -141,7 +198,7 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
             status = _STATUS_BUDGET
             break
 
-        d, assign, exact, lb = stack.pop()
+        d, assign, exact, lb, qcounts = stack.pop()
         if best_energy is not None and lb >= best_energy:
             # 已不可能更优；等界分支的叶构象字典序只会更大，无需展开。
             continue
@@ -153,6 +210,12 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
             # 否则会误杀仅前缀相同的其他构象。
             if forbid is not None and assign == forbid:
                 continue
+            # 类别下界终检：配额是纯计数约束，叶节点必须全部满足
+            # （上界在分支时已保证不越界）。
+            if qcats:
+                if any(qcounts[cj] < quotas[qcats[cj]][0]
+                       for cj in range(len(qcats))):
+                    continue
             best_energy = exact
             best_assign = assign
             continue
@@ -166,6 +229,29 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
             s = singles[d][r]
             if s is None:
                 continue  # 单体硬冲突
+
+            # ---- 类别配额检查 ----
+            new_qcounts = qcounts
+            if qcats:
+                qi = cat_index.get(categories[d][r])
+                if qi is not None:
+                    cur = qcounts[qi] + 1
+                    cat = qcats[qi]
+                    if cur > quotas[cat][1]:
+                        continue  # 超过该类别全局上限
+                    tmp = list(qcounts)
+                    tmp[qi] = cur
+                    new_qcounts = tuple(tmp)
+                # 剩余位置 d+1..n-1 是否仍有机会补足各类别下界；
+                # 任一类别无可补足即剪枝（纯计数，不涉及能量）。
+                ok = True
+                for cj, c2 in enumerate(qcats):
+                    lo = quotas[c2][0]
+                    if lo and new_qcounts[cj] + suffix_avail[c2][d + 1] < lo:
+                        ok = False
+                        break
+                if not ok:
+                    continue
 
             # exact_add: 本步固定后变为确定值的能量（单体 + 入边对能）。
             # lb_add/sub: 下界中被替换掉的估计项与其收紧后的新值。
@@ -202,12 +288,13 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
             child_lb = lb - sub + lb_add
             if best_energy is not None and child_lb >= best_energy:
                 continue
-            children.append((d + 1, new_assign, exact + exact_add, child_lb))
+            children.append((d + 1, new_assign, exact + exact_add, child_lb,
+                             new_qcounts))
 
         stack.extend(children)
 
     if status == _STATUS_BUDGET:
-        alive_lbs = [node_lb for (_, _, _, node_lb) in stack
+        alive_lbs = [node_lb for (_, _, _, node_lb, _) in stack
                      if best_energy is None or node_lb < best_energy]
         if not alive_lbs:
             # 剩余前沿已全部被最优界剪光——实际上已证最优。

@@ -190,3 +190,87 @@ def validate_fixed(n: int, counts, fixed) -> dict:
             )
         result[p] = r
     return result
+
+
+def _validate_label(label, where: str):
+    if isinstance(label, bool):
+        raise RotamerInputError(f"{where}: 类别标签不接受 bool")
+    if isinstance(label, str):
+        if not label:
+            raise RotamerInputError(f"{where}: 类别标签不能为空字符串")
+        return
+    if isinstance(label, int):
+        return
+    raise RotamerInputError(
+        f"{where}: 类别标签必须是非空 str 或 int, 得到 {type(label).__name__}"
+    )
+
+
+def validate_categories(n: int, counts, categories):
+    """校验类别标签表，返回 ``tuple[tuple[label, ...], ...]``（与单体能同形）。"""
+    if categories is None:
+        return None
+    if not isinstance(categories, (list, tuple)):
+        raise RotamerInputError(
+            f"categories: 必须是 list/tuple, 得到 {type(categories).__name__}"
+        )
+    if len(categories) != n:
+        raise RotamerInputError(
+            f"categories: 长度必须等于位置数 {n}, 实际 {len(categories)}"
+        )
+    out = []
+    for p, col in enumerate(categories):
+        where = f"categories[{p}] (位置 {p})"
+        if not isinstance(col, (list, tuple)):
+            raise RotamerInputError(
+                f"{where}: 必须是 list/tuple, 得到 {type(col).__name__}"
+            )
+        if len(col) != counts[p]:
+            raise RotamerInputError(
+                f"{where}: 长度必须等于该位置 rotamer 数 {counts[p]}, 实际 {len(col)}"
+            )
+        row = []
+        for r, label in enumerate(col):
+            _validate_label(label, f"{where}[{r}]")
+            row.append(label)
+        out.append(tuple(row))
+    return tuple(out)
+
+
+def validate_quotas(quotas, used_labels):
+    """校验配额映射 ``{label: (lo, hi)}``，返回规范化的 dict（保持插入序）。
+
+    ``used_labels`` 是类别表中实际出现过的标签集合（无 categories 时为 None）；
+    配额键必须是出现过类别的子集。
+    """
+    if quotas is None:
+        return None
+    if used_labels is None:
+        raise RotamerInputError("quotas: 指定了配额但未提供 categories")
+    if not isinstance(quotas, dict):
+        raise RotamerInputError(
+            f"quotas: 必须是 dict {{类别: (lo, hi)}}, 得到 {type(quotas).__name__}"
+        )
+    out = {}
+    for label, bounds in quotas.items():
+        _validate_label(label, "quotas 的键")
+        if label not in used_labels:
+            raise RotamerInputError(
+                f"quotas: 类别 {label!r} 未在 categories 中出现"
+            )
+        where = f"quotas[{label!r}]"
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            raise RotamerInputError(f"{where}: 必须是 (lo, hi) 二元组")
+        lo, hi = bounds
+        for name, v in (("lo", lo), ("hi", hi)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise RotamerInputError(
+                    f"{where}: {name} 必须是非负 int（bool 不接受）, "
+                    f"得到 {type(v).__name__}"
+                )
+            if v < 0:
+                raise RotamerInputError(f"{where}: {name} 必须为非负整数, 得到 {v}")
+        if lo > hi:
+            raise RotamerInputError(f"{where}: 下界 {lo} 大于上界 {hi}")
+        out[label] = (lo, hi)
+    return out

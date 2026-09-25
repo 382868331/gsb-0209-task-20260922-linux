@@ -7,7 +7,12 @@
      同时翻转才能吃到的成对负能；分支限界找到全局最优。
   2. 一个确定性生成的 6 位置实例的完整分析（最优、次优、逐位置最小代价增量）。
   3. 12 位置实例在小节点预算下耗尽：只报“当前最优 + 全局下界”，不声称精确。
-  4. 实际触发的输入拒绝边界（矩阵维度错误、bool 冒充整数）。
+  4. 类别配额：局部最低能构象违反全局类别下界，配额约束改变最优；
+     并展示类别计数与次优不同构象。
+  5. 实际触发的输入拒绝边界（矩阵维度错误、bool 冒充整数、非法配额）。
+
+说明：类别配额是**合成设计指标**（例如“某类侧链至少出现 k 次”这类
+工程约束），用于演示组合约束求解；结果不构成真实蛋白稳定性结论。
 """
 
 import random
@@ -143,8 +148,27 @@ def main():
     print(f"口径校验   : {small.global_lower_bound} <= {full.energy} "
           f"<= {small.energy} 成立；预算耗尽时只给界，不声称精确。")
 
-    # ---- 4. 实际触发的拒绝边界 ----
-    section("4. 输入拒绝边界（现场触发，非静默纠正）")
+    # ---- 4. 类别配额：局部最低能破坏全局配额 ----
+    section("4. 类别配额约束（合成设计指标，非真实蛋白稳定性结论）")
+    qsingles = [[0, 5], [0, 5], [0, 5], [0, 5]]
+    qcats = [["hyd", "pol"]] * 4
+    quotas = {"pol": (2, 3)}
+    print("单体能: 每位置 [hyd=0, pol=5]，无对能；配额: 类别 'pol' 全局 2..3 次")
+    plain = solve(qsingles, [], categories=qcats)
+    print(f"无配额最优   : {plain.assignment}  能量 {plain.energy}  "
+          f"类别计数 {plain.category_counts}（局部最低能全取 hyd）")
+    constrained = solve(qsingles, [], categories=qcats, quotas=quotas)
+    print(f"带配额最优   : {constrained.assignment}  能量 {constrained.energy}  "
+          f"类别计数 {constrained.category_counts}")
+    qana = optimize(qsingles, [], categories=qcats, quotas=quotas)
+    print(f"次优不同构象 : {qana.second_assignment}  能量 {qana.second_energy}  "
+          f"类别计数 {qana.second_category_counts}")
+    infeasible = solve(qsingles, [], categories=qcats, quotas={"pol": (5, 9)})
+    print(f"pol 至少 5 次: {infeasible.status.value}"
+          f"（只有 4 个位置，证明无解，与预算耗尽严格区分）")
+
+    # ---- 5. 实际触发的拒绝边界 ----
+    section("5. 输入拒绝边界（现场触发，非静默纠正）")
     bad_singles = [[0, 1], [2, 3, 4]]
     bad_matrix = [[0, 0, 0]]  # 位置 0 有 2 个 rotamer，矩阵却只有 1 行
     try:
@@ -157,6 +181,14 @@ def main():
         solve([[0, True], [1, 2]], [])  # bool 不得冒充整数能量
     except RotamerInputError as exc:
         print("bool 冒充整数被拒绝:")
+        print(f"  RotamerInputError: {exc}")
+
+    try:
+        solve([[0, 1], [0, 1]], [],
+              categories=[["a", "b"], ["a", "b"]],
+              quotas={"a": (-1, 2)})  # 配额边界必须是非负整数
+    except RotamerInputError as exc:
+        print("负配额边界被拒绝:")
         print(f"  RotamerInputError: {exc}")
 
     elapsed = time.perf_counter() - t0

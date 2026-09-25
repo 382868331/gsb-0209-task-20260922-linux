@@ -118,3 +118,52 @@ def chain_dp(single_energies, pair_matrices):
     e, a = min(final, key=lambda x: (x[0], x[1]))
     return a, e
 
+
+
+def _quota_ok(categories, quotas, assign):
+    """独立统计构象类别计数并核对闭区间配额（不导入被测核心）。"""
+    if not quotas:
+        return True
+    counts = {}
+    for p, r in enumerate(assign):
+        label = categories[p][r]
+        counts[label] = counts.get(label, 0) + 1
+    for label, (lo, hi) in quotas.items():
+        c = counts.get(label, 0)
+        if c < lo or c > hi:
+            return False
+    return True
+
+
+def brute_best_quota(single_energies, pair_matrices, categories, quotas):
+    """带配额的 (字典序最小最优构象, 能量, 类别计数)；无可行构象返回 (None, None, None)。"""
+    best_a, best_e = None, None
+    for assign, e in _enumerate(single_energies, pair_matrices):
+        if e is None or not _quota_ok(categories, quotas, assign):
+            continue
+        if best_e is None or e < best_e:
+            best_a, best_e = assign, e
+    if best_a is None:
+        return None, None, None
+    counts = {}
+    for p, r in enumerate(best_a):
+        label = categories[p][r]
+        counts[label] = counts.get(label, 0) + 1
+    return best_a, best_e, counts
+
+
+def brute_second_quota(single_energies, pair_matrices, categories, quotas):
+    """带配额的次优不同构象 (assignment, energy)；不存在则 (None, None)。"""
+    best_a, _, _ = brute_best_quota(single_energies, pair_matrices,
+                                    categories, quotas)
+    if best_a is None:
+        return None, None
+    sec_a, sec_e = None, None
+    for assign, e in _enumerate(single_energies, pair_matrices):
+        if assign == best_a or e is None:
+            continue
+        if not _quota_ok(categories, quotas, assign):
+            continue
+        if sec_e is None or e < sec_e:
+            sec_a, sec_e = assign, e
+    return sec_a, sec_e
