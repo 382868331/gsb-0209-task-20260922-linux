@@ -143,8 +143,30 @@ def main():
     print(f"口径校验   : {small.global_lower_bound} <= {full.energy} "
           f"<= {small.energy} 成立；预算耗尽时只给界，不声称精确。")
 
-    # ---- 4. 实际触发的拒绝边界 ----
-    section("4. 输入拒绝边界（现场触发，非静默纠正）")
+    # ---- 4. 类别标签与全局数量配额 ----
+    section("4. 类别配额：局部最低能构象违反全局数量区间")
+    qsingles = [[0, 1], [0, 1], [0, 1]]
+    qpairs = [
+        (0, 1, [[0, 0], [0, -10]]),
+        (1, 2, [[0, 0], [0, -10]]),
+    ]
+    qcats = [["core", "surface"]] * 3
+    qquotas = {"surface": (1, 2)}  # surface 类全局恰选 1..2 次
+    plain = solve(qsingles, qpairs)
+    qres = optimize(qsingles, qpairs,
+                    rotamer_categories=qcats, quotas=qquotas)
+    print("3 位置 x 2 rotamer，对能 (1,1) 处各 -10；类别: core/surface")
+    print("配额: surface 全局选取次数 ∈ [1, 2]（合成设计指标示例）")
+    print(f"无配额最优   : {plain.assignment}  能量 {plain.energy}"
+          f"（surface 选了 3 次，越出配额上界）")
+    print(f"带配额最优   : {qres.assignment}  能量 {qres.energy}  "
+          f"类别计数 {qres.category_counts}  [{qres.status.value}]")
+    print(f"带配额次优   : {qres.second_assignment}  能量 "
+          f"{qres.second_energy}  类别计数 {qres.second_category_counts}")
+    print("硬冲突仍是硬约束：配额只剪必然不可行的分支，不用罚分替代。")
+
+    # ---- 5. 实际触发的拒绝边界 ----
+    section("5. 输入拒绝边界（现场触发，非静默纠正）")
     bad_singles = [[0, 1], [2, 3, 4]]
     bad_matrix = [[0, 0, 0]]  # 位置 0 有 2 个 rotamer，矩阵却只有 1 行
     try:
@@ -157,6 +179,14 @@ def main():
         solve([[0, True], [1, 2]], [])  # bool 不得冒充整数能量
     except RotamerInputError as exc:
         print("bool 冒充整数被拒绝:")
+        print(f"  RotamerInputError: {exc}")
+
+    try:
+        solve([[0, 1], [1, 2]], [],
+              rotamer_categories=[["A", "B"], ["A", "B"]],
+              quotas={"A": (3, 1)})  # 空闭区间
+    except RotamerInputError as exc:
+        print("非法配额区间被拒绝:")
         print(f"  RotamerInputError: {exc}")
 
     elapsed = time.perf_counter() - t0

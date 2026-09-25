@@ -74,6 +74,8 @@ class SolveResult:
     energy: int | None
     global_lower_bound: int | None
     """真实最优总能量的可信下界；INFEASIBLE 时为 None。"""
+    category_counts: dict | None
+    """最优（或当前最优）构象的各类别选取次数；未给类别或无构象时为 None。"""
     nodes_expanded: int
     budget: int
 
@@ -112,6 +114,8 @@ class AnalysisResult:
     assignment: tuple | None
     energy: int | None
     global_lower_bound: int | None
+    category_counts: dict | None
+    """最优构象的类别计数；未给类别或无构象时为 None。"""
     nodes_expanded: int
     """所有子搜索展开节点数之和。"""
     budget_per_run: int
@@ -119,6 +123,8 @@ class AnalysisResult:
     second_assignment: tuple | None
     """第二个不同构象（与最优构象不同的能量最小者，并列取字典序最小）。"""
     second_energy: int | None
+    second_category_counts: dict | None
+    """次优构象的类别计数；无次优构象时为 None。"""
     fixed_costs: tuple
     """``fixed_costs[p]`` 是长度 k_p 的元组；最优 rotamer 位置为 None，
     其余为 :class:`FixedCostEntry`。"""
@@ -141,6 +147,7 @@ def _to_result(raw: dict) -> SolveResult:
         assignment=raw["assignment"],
         energy=raw["energy"],
         global_lower_bound=raw["global_lower_bound"],
+        category_counts=raw.get("category_counts"),
         nodes_expanded=raw["nodes_expanded"],
         budget=raw["budget"],
     )
@@ -157,8 +164,11 @@ class RotamerProblem:
         元素 int 或 None；同一位置对至多给一个矩阵。
     """
 
-    def __init__(self, single_energies, pair_matrices=()):
-        self._compiled = compile_problem(single_energies, pair_matrices)
+    def __init__(self, single_energies, pair_matrices=(),
+                 rotamer_categories=None, quotas=None):
+        self._compiled = compile_problem(
+            single_energies, pair_matrices,
+            rotamer_categories=rotamer_categories, quotas=quotas)
         self.n = self._compiled.n
         self.counts = self._compiled.counts
 
@@ -177,20 +187,31 @@ class RotamerProblem:
 
 
 def solve(single_energies, pair_matrices=(), *, fixed=None,
+          rotamer_categories=None, quotas=None,
           budget=DEFAULT_NODE_BUDGET) -> SolveResult:
-    """一次性便捷接口：校验输入并求最小能量构象。"""
-    compiled = compile_problem(single_energies, pair_matrices)
+    '''一次性便捷接口：校验输入并求最小能量构象。
+
+    rotamer_categories 给每个 rotamer 一个类别标签（单一归属）；
+    quotas 形如 {类别: (min, max)}，限定该类别在整个构象中
+    被选取次数的闭区间（非负整数）。两者均可省略（旧行为不变）。
+    '''
+    compiled = compile_problem(single_energies, pair_matrices,
+                               rotamer_categories=rotamer_categories,
+                               quotas=quotas)
     return _to_result(branch_and_bound(compiled, fixed=fixed, budget=budget))
 
 
 def optimize(single_energies, pair_matrices=(), *,
+             rotamer_categories=None, quotas=None,
              budget=DEFAULT_NODE_BUDGET) -> AnalysisResult:
     """一次性便捷接口：求最优、次优与全部固定代价增量。
 
     ``budget`` 是**每个**子搜索（共 2 + 非最优 rotamer 数次，至多 50 次）
     各自的节点展开预算；``nodes_expanded`` 为所有子搜索的实际展开数之和。
     """
-    compiled = compile_problem(single_energies, pair_matrices)
+    compiled = compile_problem(single_energies, pair_matrices,
+                               rotamer_categories=rotamer_categories,
+                               quotas=quotas)
     return _analyze(compiled, budget)
 
 
@@ -291,10 +312,12 @@ def _analyze(compiled, budget) -> AnalysisResult:
         assignment=base.assignment,
         energy=base.energy,
         global_lower_bound=base.global_lower_bound,
+        category_counts=base.category_counts,
         nodes_expanded=total_nodes,
         budget_per_run=budget,
         second_status=second.status,
         second_assignment=second.assignment,
         second_energy=second.energy,
+        second_category_counts=second.category_counts,
         fixed_costs=tuple(columns),
     )

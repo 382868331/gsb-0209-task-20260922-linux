@@ -15,7 +15,13 @@
 """
 
 from .errors import RotamerInputError
-from .validation import validate_problem, validate_budget, validate_fixed
+from .validation import (
+    validate_problem,
+    validate_budget,
+    validate_fixed,
+    validate_categories,
+    validate_quotas,
+)
 
 DEFAULT_NODE_BUDGET = 200_000
 
@@ -26,12 +32,18 @@ _STATUS_BUDGET = "budget_exhausted"
 
 
 class _Compiled:
-    """编译后的问题：预计算每行/全矩阵最小有限值，加速增量下界。"""
+    """编译后的问题：预计算每行/全矩阵最小有限值，加速增量下界。
+
+    可选地携带 rotamer 类别标签与各类数量的全局闭区间配额；
+    配额只增加可行性剪枝，不改变能量下界的可采纳性。
+    """
 
     __slots__ = ("n", "counts", "singles", "single_min",
-                 "incoming", "outgoing", "pair_map")
+                 "incoming", "outgoing", "pair_map",
+                 "categories", "quotas", "cat_labels", "cat_ids",
+                 "quota_idx", "suffix_avail")
 
-    def __init__(self, n, counts, singles, pairs):
+    def __init__(self, n, counts, singles, pairs, categories=None, quotas=None):
         self.n = n
         self.counts = counts
         self.singles = singles
@@ -65,10 +77,55 @@ class _Compiled:
         self.outgoing = outgoing
         self.pair_map = pair_map
 
+        # ---- 类别与配额（可选）----
+        self.categories = categories
+        self.quotas = quotas or {}
+        if categories is None:
+            self.cat_labels = ()
+            self.cat_ids = None
+            self.quota_idx = {}
+            self.suffix_avail = None
+        else:
+            labels = []
+            index = {}
+            cat_ids = []
+            for p in range(n):
+                row = []
+                for label in categories[p]:
+                    if label not in index:
+                        index[label] = len(labels)
+                        labels.append(label)
+                    row.append(index[label])
+                cat_ids.append(tuple(row))
+            self.cat_labels = tuple(labels)
+            self.cat_ids = tuple(cat_ids)
+            self.quota_idx = {index[label]: bounds
+                              for label, bounds in self.quotas.items()
+                              if label in index}
+            # 未出现类别的配额（min>0 必无解）单独保留在 self.quotas 中，
+            # 由 branch_and_bound 的根检查处理。
+            num_cat = len(labels)
+            # suffix_avail[d][c]: 位置 d..n-1 中，类别 c 至少有一个
+            # 单体能有限（即可被选择）的 rotamer 的位置数。
+            suffix = [[0] * num_cat for _ in range(n + 1)]
+            for p in range(n - 1, -1, -1):
+                row = suffix[p + 1][:]
+                offered = set()
+                for r in range(counts[p]):
+                    if singles[p][r] is not None:
+                        offered.add(cat_ids[p][r])
+                for c in offered:
+                    row[c] += 1
+                suffix[p] = row
+            self.suffix_avail = tuple(tuple(r) for r in suffix)
 
-def compile_problem(single_energies, pair_matrices):
+
+def compile_problem(single_energies, pair_matrices,
+                    rotamer_categories=None, quotas=None):
     n, counts, singles, pairs = validate_problem(single_energies, pair_matrices)
-    return _Compiled(n, counts, singles, pairs)
+    categories = validate_categories(n, counts, rotamer_categories)
+    quota_map = validate_quotas(quotas, categories)
+    return _Compiled(n, counts, singles, pairs, categories, quota_map)
 
 
 def _validate_forbid(n, counts, forbid):
@@ -112,10 +169,25 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
     single_min = compiled.single_min
     incoming = compiled.incoming
     outgoing = compiled.outgoing
+    cat_ids = compiled.cat_ids
+    quota_idx = compiled.quota_idx
+    suffix_avail = compiled.suffix_avail
+    num_cat = len(compiled.cat_labels)
 
     budget = validate_budget(budget)
     fixed = validate_fixed(n, compiled.counts, fixed)
     forbid = _validate_forbid(n, compiled.counts, forbid)
+
+    # 配额静态可行性：未在标签中出现的类别若要求 min>0，直接证明无解；
+    # 已出现类别若可提供的位置总数不足 min，同样直接证明无解。
+    if compiled.categories is not None and compiled.quotas:
+        for label, (lo, _hi) in compiled.quotas.items():
+            if lo <= 0:
+                continue
+            cidx = (compiled.cat_labels.index(label)
+                    if label in compiled.cat_labels else None)
+            if cidx is None or suffix_avail[0][cidx] < lo:
+                return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
 
     # 根下界：全部单体最小 + 每条位置对的全矩阵最小。
     root_lb = 0
@@ -129,8 +201,9 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
                 return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
             root_lb += full_min
 
-    # 栈元素: (depth, assignment_tuple, exact_energy, lower_bound)
-    stack = [(0, (), 0, root_lb)]
+    # 栈元素: (depth, assignment_tuple, exact_energy, lower_bound, cat_counts)
+    # cat_counts[c] = 已固定位置中类别 c 的选取次数（无类别时恒为空元组）。
+    stack = [(0, (), 0, root_lb, (0,) * num_cat)]
     best_energy = None
     best_assign = None
     expanded = 0
@@ -141,7 +214,7 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
             status = _STATUS_BUDGET
             break
 
-        d, assign, exact, lb = stack.pop()
+        d, assign, exact, lb, cat_counts = stack.pop()
         if best_energy is not None and lb >= best_energy:
             # 已不可能更优；等界分支的叶构象字典序只会更大，无需展开。
             continue
@@ -199,15 +272,41 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
                 continue
 
             new_assign = assign + (r,)
+
+            # ---- 类别配额剪枝（可行性剪枝，与能量下界正交）----
+            # 1) 已超上限：该类别计数超过 max，直接剪掉；
+            # 2) 下界无望：剩余位置中仍可能取该类别 c 的位置数
+            #    （suffix_avail，忽略对能冲突的乐观估计）加上当前计数
+            #    仍达不到 min，则该子树不可能满足配额，剪掉。
+            # 两者都只剪掉“必然不可行”的分支，不影响最优性。
+            new_counts = cat_counts
+            if quota_idx:
+                cid = cat_ids[d][r]
+                tmp = list(cat_counts)
+                tmp[cid] += 1
+                q = quota_idx.get(cid)
+                if q is not None and tmp[cid] > q[1]:
+                    continue
+                suf = suffix_avail[d + 1]
+                hopeless = False
+                for c2, (lo, _hi) in quota_idx.items():
+                    if lo and tmp[c2] + suf[c2] < lo:
+                        hopeless = True
+                        break
+                if hopeless:
+                    continue
+                new_counts = tuple(tmp)
+
             child_lb = lb - sub + lb_add
             if best_energy is not None and child_lb >= best_energy:
                 continue
-            children.append((d + 1, new_assign, exact + exact_add, child_lb))
+            children.append((d + 1, new_assign, exact + exact_add, child_lb,
+                             new_counts))
 
         stack.extend(children)
 
     if status == _STATUS_BUDGET:
-        alive_lbs = [node_lb for (_, _, _, node_lb) in stack
+        alive_lbs = [node_lb for (_, _, _, node_lb, _) in stack
                      if best_energy is None or node_lb < best_energy]
         if not alive_lbs:
             # 剩余前沿已全部被最优界剪光——实际上已证最优。
@@ -224,10 +323,23 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
         else:
             global_lb = best_energy
 
-    return _result(status, best_assign, best_energy, global_lb, expanded, budget)
+    return _result(status, best_assign, best_energy, global_lb, expanded,
+                   budget, _counts_for(compiled, best_assign))
 
 
-def _result(status, assignment, energy, global_lower_bound, nodes_expanded, budget):
+def _counts_for(compiled, assignment):
+    '''统计一个完整构象的类别计数；无类别或无构象时返回 None。'''
+    if compiled.categories is None or assignment is None:
+        return None
+    counts = {}
+    for p, r in enumerate(assignment):
+        label = compiled.categories[p][r]
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _result(status, assignment, energy, global_lower_bound, nodes_expanded,
+            budget, category_counts=None):
     return {
         "status": status,
         "assignment": assignment,
@@ -235,6 +347,7 @@ def _result(status, assignment, energy, global_lower_bound, nodes_expanded, budg
         "global_lower_bound": global_lower_bound,
         "nodes_expanded": nodes_expanded,
         "budget": budget,
+        "category_counts": category_counts,
     }
 
 

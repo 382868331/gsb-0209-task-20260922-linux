@@ -118,3 +118,57 @@ def chain_dp(single_energies, pair_matrices):
     e, a = min(final, key=lambda x: (x[0], x[1]))
     return a, e
 
+
+
+def _quota_ok(categories, quotas, assign):
+    cnt = {}
+    for p, r in enumerate(assign):
+        c = categories[p][r]
+        cnt[c] = cnt.get(c, 0) + 1
+    for c, (lo, hi) in quotas.items():
+        v = cnt.get(c, 0)
+        if v < lo or v > hi:
+            return False
+    return True
+
+
+def brute_best_quota(single_energies, pair_matrices, categories, quotas):
+    '''满足类别配额的 (字典序最小最优构象, 能量)；无可行构象返回 (None, None)。'''
+    best_a, best_e = None, None
+    for assign, e in _enumerate(single_energies, pair_matrices):
+        if e is None or not _quota_ok(categories, quotas, assign):
+            continue
+        if best_e is None or e < best_e:
+            best_a, best_e = assign, e
+    return best_a, best_e
+
+
+def brute_second_quota(single_energies, pair_matrices, categories, quotas):
+    '''满足配额且与最优构象不同的次优 (assignment, energy)；不存在则 (None, None)。'''
+    best_a, _ = brute_best_quota(single_energies, pair_matrices,
+                                 categories, quotas)
+    if best_a is None:
+        return None, None
+    sec_a, sec_e = None, None
+    for assign, e in _enumerate(single_energies, pair_matrices):
+        if assign == best_a or e is None:
+            continue
+        if not _quota_ok(categories, quotas, assign):
+            continue
+        if sec_e is None or e < sec_e:
+            sec_a, sec_e = assign, e
+    return sec_a, sec_e
+
+
+def brute_fixed_quota(single_energies, pair_matrices, categories, quotas,
+                      position, rotamer):
+    '''满足配额且固定 position=rotamer 的 (最优构象, 能量)；无解 (None, None)。'''
+    best_a, best_e = None, None
+    for assign, e in _enumerate(single_energies, pair_matrices):
+        if assign[position] != rotamer or e is None:
+            continue
+        if not _quota_ok(categories, quotas, assign):
+            continue
+        if best_e is None or e < best_e:
+            best_a, best_e = assign, e
+    return best_a, best_e

@@ -45,3 +45,29 @@ def generate_instance(n, k_range=(2, 5), *, seed=0, none_prob=0.15,
             m.append(row)
         pairs.append((i, j, m))
     return singles, pairs
+
+
+def generate_categories(counts, *, seed=0, labels=('A', 'B', 'C')):
+    '''为每个 rotamer 确定性分配一个类别标签（单一归属）。'''
+    rng = random.Random(9_000_017 + seed)
+    return [[labels[rng.randrange(len(labels))] for _ in range(k)]
+            for k in counts]
+
+
+def generate_quotas(categories, n, *, seed=0):
+    '''根据已生成类别确定性给出每类 (min, max) 闭区间配额。
+
+    min 取 0..实际出现次数 之间，max 取 min..n 之间，保证可能有解
+    （是否真有解仍取决于能量/硬冲突，由参考枚举判定）。
+    '''
+    rng = random.Random(7_000_033 + seed)
+    totals = {}
+    for col in categories:
+        for c in col:
+            totals[c] = totals.get(c, 0) + 1
+    quotas = {}
+    for c, total in totals.items():
+        lo = rng.randint(0, min(total, n))
+        hi = rng.randint(lo, n)
+        quotas[c] = (lo, hi)
+    return quotas

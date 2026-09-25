@@ -10,6 +10,13 @@ rotamer，用**分支限界（branch-and-bound）**求总能量最小的构象�
 - 节点预算耗尽时返回**当前最优已知解 + 可信全局下界**，严格区分于“证明无解”，
   绝不声称精确。
 
+可选扩展：**rotamer 类别标签与全局数量配额**。每个 rotamer 可被打上恰好一个
+类别标签（单一归属），调用方可为任意类别指定全局选取次数的闭区间
+`{类别: (min, max)}`（非负整数）；求解在“每个位置仍恰选一个 rotamer”的
+原约束下，额外保证各类别计数落在区间内。该配额是**合成设计指标**
+（例如人为要求的组成配比），**不得解释成真实蛋白稳定性结论**；
+硬冲突（`None`）仍然是硬约束，任何情况下都不用罚分替代。
+
 ## 运行环境
 
 - **Python 3.14.7**（标准库 only），Linux 原生。
@@ -20,7 +27,7 @@ rotamer，用**分支限界（branch-and-bound）**求总能量最小的构象�
 ## 准确命令
 
 ```bash
-# 必要测试（36 个用例，约 1 秒）
+# 必要测试（51 个用例，约 1 秒）
 python -m unittest discover -s tests -v
 
 # 演示（现场真实计算，约 0.05 秒，上限约 8 秒预算内；无 sleep、无预录结果）
@@ -53,7 +60,24 @@ pair_matrices = [
   - 位置数或每位置 rotamer 数越界；
   - **能量拒绝 `float`**，因此 NaN / Infinity 直接被拒（信息中注明）；
   - **`bool` 不得冒充整数**（`True/False` 虽是 Python int 子类，一律拒绝）；
-  - `budget`、`fixed` 中的下标同样要求真 `int` 且在界内。
+- `budget`、`fixed` 中的下标同样要求真 `int` 且在界内。
+
+### 类别标签与数量配额（可选）
+
+```python
+rotamer_categories = [
+    ["core", "surface"],   # 与 single_energies 同形：每位置每 rotamer 一个标签
+    ...
+]
+quotas = {"surface": (1, 4), "core": (2, 12)}   # {类别: (min, max)} 闭区间
+```
+
+- 标签：`str` 或 `int`（拒绝 `bool`/`None`/其他类型）；每个 rotamer **恰好一个**类别。
+- 配额边界：**非负整数** 且 `min <= max`；`max = 0` 即整类禁用。
+  给 `quotas` 必须同时给 `rotamer_categories`；配额键允许是未出现的类别
+  （其 `min > 0` 时由搜索证明 `INFEASIBLE`，而不是校验期静默改写）。
+- 只给类别、不给配额：解与旧行为完全一致，仅额外输出类别计数。
+- 非法输入（区间为空、负数、非整数、标签形状不符等）抛 `RotamerInputError`。
 
 ## 公开接口
 
@@ -66,6 +90,7 @@ res = solve(single_energies, pair_matrices,
 res.status                # SolveStatus.EXACT / INFEASIBLE / BUDGET_EXHAUSTED
 res.assignment            # tuple[int,...]，字典序最小最优构象；无解/未得解时 None
 res.energy                # 最优（或当前最优）总能量，可能 None
+res.category_counts       # dict{类别: 次数}；未给类别或无构象时 None
 res.global_lower_bound    # 真实最优的可信整数下界；INFEASIBLE 时 None
 res.nodes_expanded        # 实际展开节点数
 res.exact                 # bool：最优性是否已证明
@@ -73,11 +98,15 @@ res.exact                 # bool：最优性是否已证明
 # 附加固定约束求解（如 fixed={2: 0} 表示位置 2 必须取 rotamer 0）
 solve(singles, pairs, fixed={2: 0})
 
+# 带类别配额的求解（旧的无配额调用方式完全保留）
+solve(singles, pairs, rotamer_categories=cats, quotas={"surface": (1, 4)})
+
 # 2) 完整分析：最优 + 次优 + 全部固定代价增量
 ana = optimize(singles, pairs, budget=200_000)
 ana.assignment, ana.energy
 ana.second_assignment, ana.second_energy     # 不存在第二个可行构象时为 None
 ana.second_status
+ana.category_counts, ana.second_category_counts   # 最优/次优构象的类别计数
 ana.fixed_costs[p][r]                        # 最优 rotamer 处为 None，
                                              # 其余为 FixedCostEntry：
 entry.status            # OPTIMAL / BEST_KNOWN(预算耗尽) / INFEASIBLE
@@ -89,7 +118,8 @@ entry.lower_bound_delta# 仅 BEST_KNOWN：真实代价增量的整数下界
 energy_of(singles, pairs, assignment)
 
 # 4) 重复求解（编译一次缓存）
-prob = RotamerProblem(singles, pair_matrices)
+prob = RotamerProblem(singles, pair_matrices,
+                      rotamer_categories=None, quotas=None)
 prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
 ```
 
@@ -119,6 +149,12 @@ prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
   也如实报 `EXACT`。
 - **次优构象**：对最优构象做“整构象排除”后再搜一次（只在叶深度排除，
   绝不按前缀剪枝，避免误杀仅前缀相同的构象）。
+- **配额剪枝（可行性剪枝，与能量下界正交）**：搜索逐节点维护各类别已选
+  次数，两类必然不可行的分支直接剪掉——(a) 某类别计数**已超上限**；
+  (b) 剩余位置中仍可能取该类别的位置数（忽略对能冲突的乐观后缀估计）
+  加上当前计数**仍达不到该类下界**。两者都只剪必然不可行的分支，
+  不丢弃任何负成对能量，能量下界保持可采纳，因此不会制造错误剪枝。
+  配额导致的不可满足同样报 `INFEASIBLE`，与预算耗尽严格区分。
 - **固定代价增量**：对每个 (位置, 非最优 rotamer) 做一次带固定约束的搜索，
   增量由该约束最优与全局最优的整数差给出；无解单独标记 `INFEASIBLE`。
 - **无浮点**：能量与界全为整数，求解全程不产生浮点误差，也不需要容差。
@@ -146,6 +182,10 @@ prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
 - 次优与固定增量在预算耗尽时分别给 `second_status` / `BEST_KNOWN` 与下界，
   增量同样可能只是界，不做跨子搜索的联合收紧。
 - 不提供命令行产品/服务/文件格式；仅作为可 `import` 的库与固定 `demo.py`。
+- 类别配额是**合成设计指标**接口：库只保证计数落在给定闭区间，
+  不把配额结果解释成任何真实蛋白稳定性/物理结论。
+- 配额的下界可行性检查是逐类别独立的必要条件（不做跨类别的联合
+  匹配可行性判定），因此剪枝保守、正确，但理论上可能少剪一些分支。
 
 ## 仓库结构
 
@@ -159,6 +199,7 @@ rotamer_select/          # 题库（核心算法）
 tests/
   reference.py           # 独立参考：全枚举(≤6) + 链式 DP（不 import 核心）
   datagen.py             # 固定种子确定性数据生成
-  test_solver.py         # 36 个用例
-demo.py                  # 固定输入演示（贪心失败 / 预算耗尽 / 拒绝边界）
+  test_solver.py         # 36 个用例（无配额旧行为）
+  test_quotas.py         # 15 个用例（类别配额新行为）
+demo.py                  # 固定输入演示（贪心失败 / 预算耗尽 / 类别配额 / 拒绝边界）
 ```
