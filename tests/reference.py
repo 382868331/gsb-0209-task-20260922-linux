@@ -118,3 +118,75 @@ def chain_dp(single_energies, pair_matrices):
     e, a = min(final, key=lambda x: (x[0], x[1]))
     return a, e
 
+
+
+# ---------------------------------------------------------------------------
+# 构象淘汰的独立参考（同样不 import rotamer_select）
+# ---------------------------------------------------------------------------
+
+def all_optimal(single_energies, pair_matrices):
+    """返回全部取得最优能量的构象（list[tuple]）；无可行构象返回 []。"""
+    _, best_e = brute_best(single_energies, pair_matrices)
+    if best_e is None:
+        return []
+    return [a for a, e in _enumerate(single_energies, pair_matrices)
+            if e == best_e]
+
+
+def verify_domination(single_energies, pair_matrices, position, eliminated,
+                      dominator, context):
+    """独立复核一条支配证书。
+
+    对 context（各位置剩余候选）中所有其余位置选择，朴素计算
+    E(eliminated, x) - E(dominator, x)：
+
+    - 两侧同为硬冲突的组合对两者都不可行，不计入比较域；
+    - eliminated 侧硬冲突而 dominator 侧可行：差为 +inf，天然成立；
+    - dominator 侧硬冲突而 eliminated 侧可行：该组合不在比较域内，跳过
+      （证书只需对“支配者可行”的选择成立——支配者不可行时该构象本就
+      不含支配者，但此时 eliminated 构象是否最优需由其他证书/轮次保证；
+      本参考按“所有 dominator 可行的组合差 > 0”口径复核）。
+
+    返回 (是否成立, 有限差的最小值或 None)。全程整数，无 NaN。
+    """
+    n = len(single_energies)
+    indexed = {(i, j): m for i, j, m in pair_matrices}
+    others = [q for q in range(n) if q != position]
+    worst = None
+    for xs in product(*(context[q] for q in others)):
+        env = dict(zip(others, xs))
+        diff = 0
+        state = "finite"  # finite / pos_inf / skip
+        # 单体项
+        vr = single_energies[position][eliminated]
+        vs = single_energies[position][dominator]
+        if vr is None and vs is None:
+            continue  # 该位置两侧都不可行：此组合对两者都被排除
+        if vr is None:
+            continue  # +inf，天然成立
+        if vs is None:
+            continue  # dominator 不可行：不在比较域
+        diff = vr - vs
+        for (a, b), m in indexed.items():
+            if a != position and b != position:
+                continue
+            if a == position:
+                x = env[b]
+                cr, cs = m[eliminated][x], m[dominator][x]
+            else:
+                x = env[a]
+                cr, cs = m[x][eliminated], m[x][dominator]
+            if cr is None and cs is None:
+                continue
+            if cr is None:
+                state = "pos_inf"
+                break
+            if cs is None:
+                state = "skip"
+                break
+            diff += cr - cs
+        if state == "finite":
+            worst = diff if worst is None else min(worst, diff)
+    if worst is None:
+        return True, None
+    return worst > 0, worst

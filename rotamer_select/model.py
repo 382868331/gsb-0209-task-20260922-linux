@@ -17,12 +17,14 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from .errors import RotamerInputError
 from .solver import (
     compile_problem,
     branch_and_bound,
     exact_energy,
     DEFAULT_NODE_BUDGET,
 )
+from .validation import validate_budget, validate_fixed
 
 __all__ = [
     "DEFAULT_NODE_BUDGET",
@@ -35,6 +37,7 @@ __all__ = [
     "solve",
     "optimize",
     "energy_of",
+    "validate_allowed",
 ]
 
 
@@ -157,41 +160,118 @@ class RotamerProblem:
         元素 int 或 None；同一位置对至多给一个矩阵。
     """
 
-    def __init__(self, single_energies, pair_matrices=()):
-        self._compiled = compile_problem(single_energies, pair_matrices)
-        self.n = self._compiled.n
-        self.counts = self._compiled.counts
+    def __init__(self, single_energies, pair_matrices=(), allowed=None):
+        self._full = compile_problem(single_energies, pair_matrices)
+        self.n = self._full.n
+        self.counts = self._full.counts
+        if allowed is None:
+            self._compiled = self._full
+            self._maps = None
+            self._revs = None
+        else:
+            norm = validate_allowed(self.n, self.counts, allowed)
+            self._compiled, self._maps, self._revs = _reduce_compiled(
+                self._full, norm
+            )
+
+    def _translate_fixed(self, fixed):
+        """把原始 ID 的 fixed 约束翻译成缩减下标。
+
+        固定到已被淘汰的 rotamer 时返回 None（该约束下必然无解）。"""
+        if self._maps is None or not fixed:
+            return fixed
+        out = {}
+        for p, r in fixed.items():
+            if r not in self._revs[p]:
+                return None
+            out[p] = self._revs[p][r]
+        return out
+
+    def _restore(self, assignment):
+        """把缩减下标构象还原为原始 rotamer ID。"""
+        if assignment is None or self._maps is None:
+            return assignment
+        return tuple(self._maps[p][r] for p, r in enumerate(assignment))
 
     def solve(self, fixed=None, budget=DEFAULT_NODE_BUDGET) -> SolveResult:
         """求最小能量构象。``fixed`` 可给 ``{position: rotamer}`` 附加固定约束。"""
-        raw = branch_and_bound(self._compiled, fixed=fixed, budget=budget)
-        return _to_result(raw)
+        budget = validate_budget(budget)
+        fixed = validate_fixed(self.n, self.counts, fixed)
+        translated = self._translate_fixed(fixed)
+        if translated is None:
+            return _infeasible_result(budget)
+        raw = branch_and_bound(self._compiled, fixed=translated, budget=budget)
+        res = _to_result(raw)
+        if self._maps is None or res.assignment is None:
+            return res
+        return SolveResult(
+            status=res.status, assignment=self._restore(res.assignment),
+            energy=res.energy, global_lower_bound=res.global_lower_bound,
+            nodes_expanded=res.nodes_expanded, budget=res.budget,
+        )
 
     def optimize(self, budget=DEFAULT_NODE_BUDGET) -> AnalysisResult:
-        """完整分析，见 :func:`optimize`。"""
-        return _analyze(self._compiled, budget)
+        """完整分析，见 :func:`optimize`。使用 allowed 时，fixed_costs 只覆盖
+        幸存候选，entry.rotamer 与返回构象均为原始 ID。"""
+        ana = _analyze(self._compiled, budget)
+        if self._maps is None:
+            return ana
+        columns = []
+        for p in range(self.n):
+            col = []
+            for entry in ana.fixed_costs[p]:
+                if entry is None:
+                    col.append(None)
+                    continue
+                col.append(FixedCostEntry(
+                    position=entry.position,
+                    rotamer=self._maps[p][entry.rotamer],
+                    status=entry.status,
+                    minimal_energy=entry.minimal_energy,
+                    delta=entry.delta,
+                    lower_bound_delta=entry.lower_bound_delta,
+                    nodes_expanded=entry.nodes_expanded,
+                ))
+            columns.append(tuple(col))
+        return AnalysisResult(
+            status=ana.status,
+            assignment=self._restore(ana.assignment),
+            energy=ana.energy,
+            global_lower_bound=ana.global_lower_bound,
+            nodes_expanded=ana.nodes_expanded,
+            budget_per_run=ana.budget_per_run,
+            second_status=ana.second_status,
+            second_assignment=self._restore(ana.second_assignment),
+            second_energy=ana.second_energy,
+            fixed_costs=tuple(columns),
+        )
 
     def energy_of(self, assignment) -> int:
-        """计算给定完整构象的精确总能量（遇 None 硬冲突抛错）。"""
-        return exact_energy(self._compiled, assignment)
+        """计算给定完整构象的精确总能量（原始 ID；遇 None 硬冲突抛错）。"""
+        return exact_energy(self._full, assignment)
 
 
-def solve(single_energies, pair_matrices=(), *, fixed=None,
+def solve(single_energies, pair_matrices=(), *, fixed=None, allowed=None,
           budget=DEFAULT_NODE_BUDGET) -> SolveResult:
-    """一次性便捷接口：校验输入并求最小能量构象。"""
-    compiled = compile_problem(single_energies, pair_matrices)
-    return _to_result(branch_and_bound(compiled, fixed=fixed, budget=budget))
+    """一次性便捷接口：校验输入并求最小能量构象。
+
+    allowed 可给 {position: [原始 rotamer ID, ...]} 剩余候选映射
+    （如 eliminate() 的 remaining），返回构象仍用原始 ID。"""
+    return RotamerProblem(single_energies, pair_matrices, allowed=allowed).solve(
+        fixed=fixed, budget=budget
+    )
 
 
-def optimize(single_energies, pair_matrices=(), *,
+def optimize(single_energies, pair_matrices=(), *, allowed=None,
              budget=DEFAULT_NODE_BUDGET) -> AnalysisResult:
     """一次性便捷接口：求最优、次优与全部固定代价增量。
 
     ``budget`` 是**每个**子搜索（共 2 + 非最优 rotamer 数次，至多 50 次）
     各自的节点展开预算；``nodes_expanded`` 为所有子搜索的实际展开数之和。
     """
-    compiled = compile_problem(single_energies, pair_matrices)
-    return _analyze(compiled, budget)
+    return RotamerProblem(single_energies, pair_matrices, allowed=allowed).optimize(
+        budget=budget
+    )
 
 
 def energy_of(single_energies, pair_matrices, assignment) -> int:
@@ -297,4 +377,88 @@ def _analyze(compiled, budget) -> AnalysisResult:
         second_assignment=second.assignment,
         second_energy=second.energy,
         fixed_costs=tuple(columns),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 剩余候选映射（allowed）：在淘汰后的子集上求解，并把构象还原为原始 ID。
+# ---------------------------------------------------------------------------
+
+def validate_allowed(n, counts, allowed):
+    """校验剩余候选映射 {position: [原始 rotamer ID, ...]}。
+
+    缺省位置表示保留全部候选；每个给出的列表必须非空、元素为界内真 int、
+    无重复。返回 tuple[tuple[int, ...], ...]（每位置升序原始 ID）。
+    """
+    if not isinstance(allowed, dict):
+        raise RotamerInputError(
+            f"allowed: 必须是 dict {{position: [rotamer, ...]}}, 得到 {type(allowed).__name__}"
+        )
+    result = [tuple(range(k)) for k in counts]
+    for p, kept in allowed.items():
+        if isinstance(p, bool) or not isinstance(p, int):
+            raise RotamerInputError(
+                f"allowed 的位置键 {p!r}: 必须是 int（bool 不接受）"
+            )
+        if not (0 <= p < n):
+            raise RotamerInputError(f"allowed: 位置 {p} 越界, 合法范围 0..{n - 1}")
+        if not isinstance(kept, (list, tuple)):
+            raise RotamerInputError(
+                f"allowed[{p}]: 必须是 list/tuple, 得到 {type(kept).__name__}"
+            )
+        if len(kept) == 0:
+            raise RotamerInputError(
+                f"allowed[{p}]: 至少保留 1 个候选；若某位置无可行候选，"
+                f"请用 eliminate() 返回的无解证据而不是继续求解"
+            )
+        seen = set()
+        norm = []
+        for r in kept:
+            if isinstance(r, bool) or not isinstance(r, int):
+                raise RotamerInputError(
+                    f"allowed[{p}]: rotamer 必须是 int（bool 不接受）, 得到 {type(r).__name__}"
+                )
+            if not (0 <= r < counts[p]):
+                raise RotamerInputError(
+                    f"allowed[{p}]: rotamer {r} 越界, 合法范围 0..{counts[p] - 1}"
+                )
+            if r in seen:
+                raise RotamerInputError(f"allowed[{p}]: rotamer {r} 重复")
+            seen.add(r)
+            norm.append(r)
+        result[p] = tuple(sorted(norm))
+    return tuple(result)
+
+
+def _reduce_compiled(compiled, allowed):
+    """按 allowed（每位置原始 ID 元组）构建缩减问题与 ID 映射。
+
+    返回 (reduced_compiled, maps, revs)：
+    maps[p][缩减下标] = 原始 ID；revs[p][原始 ID] = 缩减下标。
+    """
+    from .solver import _Compiled
+
+    n = compiled.n
+    maps = allowed
+    revs = tuple({orig: idx for idx, orig in enumerate(maps[p])} for p in range(n))
+    singles = tuple(
+        tuple(compiled.singles[p][orig] for orig in maps[p]) for p in range(n)
+    )
+    pairs = []
+    for (a, b), rows in compiled.pair_map.items():
+        sub = tuple(
+            tuple(rows[oa][ob] for ob in maps[b]) for oa in maps[a]
+        )
+        pairs.append((a, b, sub))
+    pairs.sort(key=lambda t: (t[0], t[1]))
+    reduced = _Compiled(
+        n, tuple(len(m) for m in maps), singles, tuple(pairs)
+    )
+    return reduced, maps, revs
+
+
+def _infeasible_result(budget):
+    return SolveResult(
+        status=SolveStatus.INFEASIBLE, assignment=None, energy=None,
+        global_lower_bound=None, nodes_expanded=0, budget=budget,
     )

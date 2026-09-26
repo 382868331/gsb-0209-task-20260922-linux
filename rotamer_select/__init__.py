@@ -14,6 +14,13 @@
 from .errors import RotamerError, RotamerInputError
 from .validation import MAX_POSITIONS, MIN_ROTAMERS, MAX_ROTAMERS
 from .solver import DEFAULT_NODE_BUDGET
+from .eliminate import (
+    INF,
+    BoundTerm,
+    EliminationCertificate,
+    EliminationResult,
+    eliminate,
+)
 from .model import (
     RotamerProblem,
     SolveStatus,
@@ -42,4 +49,9 @@ __all__ = [
     "solve",
     "optimize",
     "energy_of",
+    "INF",
+    "BoundTerm",
+    "EliminationCertificate",
+    "EliminationResult",
+    "eliminate",
 ]

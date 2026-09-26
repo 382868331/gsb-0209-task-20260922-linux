@@ -10,21 +10,35 @@ rotamer，用**分支限界（branch-and-bound）**求总能量最小的构象�
 - 节点预算耗尽时返回**当前最优已知解 + 可信全局下界**，严格区分于“证明无解”，
   绝不声称精确。
 
+本次增量新增**构象淘汰**入口：在求解前先证明某些 rotamer 不可能出现在
+任何最优构象中（严格支配 + 逐项最不利差界），把它们去掉并给出可独立复核的
+淘汰证书；旧求解器可接收剩余候选映射（allowed）并把构象还原为原始 ID。
+
 ## 运行环境
 
 - **Python 3.14.7**（标准库 only），Linux 原生。
 - 安装 Python 后**无需安装任何第三方依赖**（`requirements.txt` 为空占位）。
+
+venv 准备（可选但推荐；无任何第三方包要装）：
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+```
 - 核心算法、测试、演示全部离线：不访问网络、账号、数据库、云 API、Docker。
 - 示例数据由仓库内固定种子代码确定性生成，不依赖任何外部附件。
 
 ## 准确命令
 
 ```bash
-# 必要测试（36 个用例，约 1 秒）
+# 必要测试（53 个用例，约 3 秒）
 python -m unittest discover -s tests -v
 
-# 演示（现场真实计算，约 0.05 秒，上限约 8 秒预算内；无 sleep、无预录结果）
+# 基线演示（现场真实计算，约 0.05 秒；无 sleep、无预录结果）
 python demo.py
+
+# 构象淘汰演示（现场真实计算，约 0.02 秒，上限 90 秒；无 sleep、无预录结果）
+python demo_iteration.py
 ```
 
 在仓库根目录（本文件所在目录）执行。测试中“独立参考”
@@ -91,7 +105,34 @@ energy_of(singles, pairs, assignment)
 # 4) 重复求解（编译一次缓存）
 prob = RotamerProblem(singles, pair_matrices)
 prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
+
+# 5) 构象淘汰：先证明不可能最优，再删去
+from rotamer_select import eliminate
+
+res = eliminate(single_energies, pair_matrices)
+res.status                 # "ok" / "infeasible"（某残基没有可行候选）
+res.remaining              # remaining[p] = 位置 p 幸存候选的原始 ID 元组
+res.certificates           # 每条 EliminationCertificate：
+cert.position, cert.eliminated, cert.dominator   # 支配者；自身硬冲突时为 None
+cert.terms                 # 逐项差界（单体 + 每条位置对的最小差与取界选择）
+cert.lower_bound_diff      # 能量差下界，严格 > 0 或 INF（"+inf" 哨兵，非浮点）
+cert.context               # 取证时刻各位置剩余候选快照（供独立复核）
+res.iterations             # 迭代轮数（直到不动点）
+res.infeasible_position, res.infeasible_evidence  # 无解位置与证据证书
+
+# 6) 旧求解器接收剩余候选映射并还原原始 ID
+solve(singles, pairs, allowed={p: list(c) for p, c in enumerate(res.remaining)})
+optimize(singles, pairs, allowed=...)        # 同上；fixed_costs 只覆盖幸存候选
+RotamerProblem(singles, pairs, allowed=...)  # solve/optimize 返回原始 ID 构象
 ```
+
+**淘汰规则**：对位置 p 的候选 r 与支配者 s，若
+single(r)-single(s) + 每条位置对 min_x[pair(r,x)-pair(s,x)] 之和 > 0（严格），
+则 r 在任何其余选择下都严格更差，可删去。硬冲突（None）按不可行组合
+处理：两侧同 None 记差 0；r 侧 None 记 +inf；s 侧 None 使该界失败
+（绝不做无穷大相减产生 NaN）。**相等能量不淘汰**（下界 == 0 保留），
+避免丢掉并列最优。迭代到不动点；若某位置候选被清空，返回
+status="infeasible" 与导致清空的全部证书作为无解证据。
 
 `budget` 是每次子搜索各自可展开的节点数（正整数）；`optimize` 至多发起
 `2 + Σ(k_p−1) ≤ 50` 个子搜索，`nodes_expanded` 为它们的实际展开数之和。
@@ -145,7 +186,14 @@ prob.solve(); prob.solve(fixed={0: 1}); prob.optimize(); prob.energy_of(a)
 - “相邻”由用户显式给矩阵声明；库不假设距离/拓扑，也不做几何计算。
 - 次优与固定增量在预算耗尽时分别给 `second_status` / `BEST_KNOWN` 与下界，
   增量同样可能只是界，不做跨子搜索的联合收紧。
-- 不提供命令行产品/服务/文件格式；仅作为可 `import` 的库与固定 `demo.py`。
+- 不提供命令行产品/服务/文件格式；仅作为可 import 的库与固定 demo.py /
+  demo_iteration.py。
+- 淘汰是单候选对单候选的严格支配（一阶 DEE 式界），不做多候选联合支配、
+  不做组合式不可行推理：某些实际不可行的候选可能幸存（不影响正确性，
+  只影响缩减幅度）；缩减效果依实例而定，演示以候选数减少为准，
+  不以耗时提升作为功能验收。
+- allowed 映射要求每位置至少保留 1 个候选；某位置无可行候选时请使用
+  eliminate() 返回的无解证据，而不是继续求解。
 
 ## 仓库结构
 
@@ -155,10 +203,13 @@ rotamer_select/          # 题库（核心算法）
   errors.py              # RotamerInputError
   validation.py          # 严格输入校验与上限
   solver.py              # 分支限界核心（纯整数）
-  model.py               # 结果类型与 solve/optimize/RotamerProblem
+  model.py               # 结果类型、solve/optimize/RotamerProblem、allowed 映射
+  eliminate.py           # 构象淘汰：严格支配判定、证书、迭代到不动点
 tests/
-  reference.py           # 独立参考：全枚举(≤6) + 链式 DP（不 import 核心）
+  reference.py           # 独立参考：全枚举(≤6) + 链式 DP + 证书复核（不 import 核心）
   datagen.py             # 固定种子确定性数据生成
-  test_solver.py         # 36 个用例
+  test_solver.py         # 求解器 36 个用例
+  test_eliminate.py      # 淘汰与 allowed 映射 17 个用例
 demo.py                  # 固定输入演示（贪心失败 / 预算耗尽 / 拒绝边界）
+demo_iteration.py        # 构象淘汰演示（候选缩减、证书复核、无解证据）
 ```
