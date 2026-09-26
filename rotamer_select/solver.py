@@ -15,7 +15,12 @@
 """
 
 from .errors import RotamerInputError
-from .validation import validate_problem, validate_budget, validate_fixed
+from .validation import (
+    validate_problem,
+    validate_budget,
+    validate_fixed,
+    validate_allowed,
+)
 
 DEFAULT_NODE_BUDGET = 200_000
 
@@ -66,6 +71,77 @@ class _Compiled:
         self.pair_map = pair_map
 
 
+class _RestrictedCompiled:
+    """在已编译问题上限定每位置候选子集的视图（不复制能量矩阵）。
+
+    内部 rotamer 下标在子集内紧凑编号（0..k'-1），``orig_ids`` 记录它们
+    对应的原 rotamer ID；求解结果由调用方经 :meth:`restore_assignment` 还原。
+    """
+
+    __slots__ = ("n", "counts", "singles", "single_min",
+                 "incoming", "outgoing", "pair_map", "orig_ids")
+
+    def __init__(self, base, allowed):
+        # allowed 已由 validate_allowed 归一化为每位置升序 tuple。
+        self.n = base.n
+        self.orig_ids = tuple(tuple(ids) for ids in allowed)
+        self.counts = tuple(len(ids) for ids in self.orig_ids)
+
+        def local_index(p):
+            return {orig: loc for loc, orig in enumerate(self.orig_ids[p])}
+
+        self.singles = tuple(
+            tuple(base.singles[p][r] for r in self.orig_ids[p])
+            for p in range(self.n)
+        )
+        single_min = []
+        for p in range(self.n):
+            finite = [v for v in self.singles[p] if v is not None]
+            single_min.append(min(finite) if finite else None)
+        self.single_min = tuple(single_min)
+
+        incoming = tuple([] for _ in range(self.n))
+        outgoing = tuple([] for _ in range(self.n))
+        pair_map = {}
+        for (a, b), base_rows in base.pair_map.items():
+            ia, ib = local_index(a), local_index(b)
+            rows_a = []
+            for ra in self.orig_ids[a]:
+                row = tuple(base_rows[ra][rb] for rb in self.orig_ids[b])
+                rows_a.append(row)
+            rows = tuple(rows_a)
+            row_min = tuple(
+                (min(v for v in row if v is not None) if any(v is not None for v in row)
+                 else None)
+                for row in rows
+            )
+            all_finite = [v for row in rows for v in row if v is not None]
+            full_min = min(all_finite) if all_finite else None
+            incoming[b].append((a, rows, row_min))
+            outgoing[a].append((full_min, row_min))
+            pair_map[(a, b)] = rows
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.pair_map = pair_map
+
+    def restore_assignment(self, local_assignment):
+        """把紧凑下标构象还原为原 rotamer ID 构象。"""
+        if local_assignment is None:
+            return None
+        return tuple(self.orig_ids[p][r] for p, r in enumerate(local_assignment))
+
+
+def restrict_problem(compiled, allowed=None):
+    """在已编译问题上限定每位置候选，返回 (受限编译视图, 原ID映射)。
+
+    ``allowed`` 为 ``{position: [原rotamer, ...]}``，可只给部分位置；
+    返回的第二个值是每位置 ``(原ID, ...)`` 的 tuple。
+    """
+    norm = validate_allowed(compiled.n, compiled.counts, allowed)
+    view = _RestrictedCompiled(compiled, norm)
+    return view, view.orig_ids
+
+
 def compile_problem(single_energies, pair_matrices):
     n, counts, singles, pairs = validate_problem(single_energies, pair_matrices)
     return _Compiled(n, counts, singles, pairs)
@@ -96,7 +172,8 @@ def _validate_forbid(n, counts, forbid):
     return tuple(out)
 
 
-def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDGET):
+def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDGET,
+                     allowed=None):
     """执行一次分支限界搜索。
 
     返回 dict：
@@ -106,16 +183,37 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
       nodes_expanded: int
       budget: int
     """
+    n0 = compiled.n
+    orig_counts = compiled.counts
+
+    budget = validate_budget(budget)
+    fixed = validate_fixed(n0, orig_counts, fixed)
+    forbid = _validate_forbid(n0, orig_counts, forbid)
+
+    view = None
+    if allowed is not None:
+        view, _ = restrict_problem(compiled, allowed)
+        # 固定/排除约束都按原 ID 给出，翻译成紧凑下标。
+        local_fixed = {}
+        for p, r in fixed.items():
+            ids = view.orig_ids[p]
+            if r not in ids:
+                return _result(_STATUS_INFEASIBLE, None, None, None, 0, budget)
+            local_fixed[p] = ids.index(r)
+        fixed = local_fixed
+        if forbid is not None and all(forbid[p] in view.orig_ids[p]
+                                      for p in range(n0)):
+            forbid = tuple(view.orig_ids[p].index(forbid[p]) for p in range(n0))
+        else:
+            forbid = None
+        compiled = view
+
     n = compiled.n
     counts = compiled.counts
     singles = compiled.singles
     single_min = compiled.single_min
     incoming = compiled.incoming
     outgoing = compiled.outgoing
-
-    budget = validate_budget(budget)
-    fixed = validate_fixed(n, compiled.counts, fixed)
-    forbid = _validate_forbid(n, compiled.counts, forbid)
 
     # 根下界：全部单体最小 + 每条位置对的全矩阵最小。
     root_lb = 0
@@ -224,7 +322,8 @@ def branch_and_bound(compiled, fixed=None, forbid=None, budget=DEFAULT_NODE_BUDG
         else:
             global_lb = best_energy
 
-    return _result(status, best_assign, best_energy, global_lb, expanded, budget)
+    restored = compiled.restore_assignment(best_assign) if view is not None else best_assign
+    return _result(status, restored, best_energy, global_lb, expanded, budget)
 
 
 def _result(status, assignment, energy, global_lower_bound, nodes_expanded, budget):

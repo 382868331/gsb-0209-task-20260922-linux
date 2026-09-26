@@ -190,3 +190,46 @@ def validate_fixed(n: int, counts, fixed) -> dict:
             )
         result[p] = r
     return result
+
+
+def validate_allowed(n: int, counts, allowed):
+    """校验剩余候选映射 ``{position: [rotamer, ...]}``。
+
+    每位置至少保留一个候选；键与 rotamer 必须是真 int（拒绝 bool）；
+    允许只给部分位置（未给的位置保留全部候选）。返回每位置升序去重 tuple。
+    """
+    if allowed is None:
+        return tuple(tuple(range(counts[p])) for p in range(n))
+    if not isinstance(allowed, dict):
+        raise RotamerInputError(
+            f"allowed: 必须是 dict {{position: [rotamer, ...]}}, 得到 {type(allowed).__name__}"
+        )
+    result = [set(range(counts[p])) for p in range(n)]
+    for p, rs in allowed.items():
+        if not _is_real_int(p):
+            raise RotamerInputError(
+                f"allowed 的位置键 {p!r}: 必须是 int（bool 不接受）"
+            )
+        if not (0 <= p < n):
+            raise RotamerInputError(f"allowed: 位置 {p} 越界, 合法范围 0..{n - 1}")
+        if not isinstance(rs, (list, tuple, set, frozenset)):
+            raise RotamerInputError(
+                f"allowed[{p}]: 候选集合必须是 list/tuple/set, 得到 {type(rs).__name__}"
+            )
+        kept = set()
+        for r in rs:
+            if not _is_real_int(r):
+                raise RotamerInputError(
+                    f"allowed[{p}]: rotamer 必须是 int（bool 不接受）, 得到 {type(r).__name__}"
+                )
+            if not (0 <= r < counts[p]):
+                raise RotamerInputError(
+                    f"allowed[{p}]: rotamer {r} 越界, 合法范围 0..{counts[p] - 1}"
+                )
+            kept.add(r)
+        if not kept:
+            raise RotamerInputError(
+                f"allowed[{p}]: 至少保留一个候选，空集合请直接以无解处理"
+            )
+        result[p] = kept
+    return tuple(tuple(sorted(s)) for s in result)
